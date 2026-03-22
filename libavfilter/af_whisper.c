@@ -38,6 +38,8 @@
 
 #include "formats.h"
 
+#define WHISPER_HAS_THREADS (HAVE_PTHREADS || HAVE_W32THREADS || HAVE_OS2THREADS)
+
 typedef struct WhisperContext {
     const AVClass *class;
     char *model_path;
@@ -45,6 +47,7 @@ typedef struct WhisperContext {
     bool translate;
     bool use_gpu;
     int gpu_device;
+    bool sync;
     char *vad_model_path;
     float vad_threshold;
     int64_t vad_min_speech_duration;
@@ -70,6 +73,27 @@ typedef struct WhisperContext {
 
     AVIOContext *avio_context;
     int index;
+
+#if WHISPER_HAS_THREADS
+    float *infer_buffer;
+    int infer_buffer_size;
+    int64_t infer_buffer_start_ms;
+
+    pthread_t infer_thread;
+    AVMutex infer_mutex;
+    AVCond infer_cond;
+    int infer_pending;
+    int infer_done;
+    int shutdown;
+    int thread_created;
+
+    char *infer_result_text;
+    float infer_result_duration;
+    int64_t infer_result_start_ms;
+    int infer_n_threads;
+
+    AVFilterContext *filter_ctx;
+#endif
 } WhisperContext;
 
 static void cb_log(enum ggml_log_level level, const char *text, void *user_data)
@@ -86,6 +110,191 @@ static void cb_log(enum ggml_log_level level, const char *text, void *user_data)
     }
     av_log(ctx, av_log_level, "%s", text);
 }
+
+#if WHISPER_HAS_THREADS
+static void *whisper_infer_thread(void *arg)
+{
+    WhisperContext *wctx = arg;
+    AVFilterContext *ctx = wctx->filter_ctx;
+
+    ff_thread_setname("whisper-infer");
+
+    ff_mutex_lock(&wctx->infer_mutex);
+    while (!wctx->shutdown) {
+        while (!wctx->infer_pending && !wctx->shutdown)
+            ff_cond_wait(&wctx->infer_cond, &wctx->infer_mutex);
+
+        if (wctx->shutdown)
+            break;
+
+        /* Copy inference parameters while locked */
+        float *samples = wctx->infer_buffer;
+        int n_samples = wctx->infer_buffer_size;
+        int64_t timestamp_ms = wctx->infer_buffer_start_ms;
+        int n_threads = wctx->infer_n_threads;
+        ff_mutex_unlock(&wctx->infer_mutex);
+
+        /* Run whisper inference without lock held */
+        const float duration = (float)n_samples / WHISPER_SAMPLE_RATE;
+
+        av_log(ctx, AV_LOG_INFO,
+               "async transcription at %" PRId64 " ms, %d samples (%.2f seconds)...\n",
+               timestamp_ms, n_samples, duration);
+
+        struct whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        params.language = wctx->language;
+        params.translate = wctx->translate;
+        params.n_threads = n_threads;
+        params.print_special = 0;
+        params.print_progress = 0;
+        params.print_realtime = 0;
+        params.print_timestamps = 0;
+        params.max_len = wctx->max_len;
+        params.token_timestamps = (wctx->max_len > 0);
+
+        char *segments_text = NULL;
+
+        if (whisper_full(wctx->ctx_wsp, params, samples, n_samples) != 0) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to process audio with whisper.cpp (async)\n");
+        } else {
+            const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
+
+            for (int i = 0; i < n_segments; ++i) {
+                const char *text = whisper_full_get_segment_text(wctx->ctx_wsp, i);
+                if (av_isspace(text[0]))
+                    text++;
+                char *text_cleaned = av_strireplace(text, "[BLANK_AUDIO]", "");
+
+                if (av_strnlen(text_cleaned, 1) == 0) {
+                    av_freep(&text_cleaned);
+                    continue;
+                }
+
+                if (wctx->max_len > 0 && (strcmp(text_cleaned, "[") == 0 || strcmp(text_cleaned, "]") == 0 ||
+                                          strcmp(text_cleaned, "BLANK") == 0 || strcmp(text_cleaned, "_") == 0 ||
+                                          strcmp(text_cleaned, "AUDIO") == 0)) {
+                    av_freep(&text_cleaned);
+                    continue;
+                }
+
+                const bool turn = whisper_full_get_segment_speaker_turn_next(wctx->ctx_wsp, i);
+                const int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
+                const int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+
+                av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "%s]: \"%s\"\n",
+                       timestamp_ms + t0_ms, timestamp_ms + t1_ms,
+                       turn ? " (turn)" : "", text_cleaned);
+
+                if (segments_text) {
+                    char *new_text = av_asprintf("%s%s", segments_text, text_cleaned);
+                    av_freep(&segments_text);
+                    segments_text = new_text;
+                } else {
+                    segments_text = av_strdup(text_cleaned);
+                }
+
+                if (wctx->avio_context) {
+                    const int64_t start_t = timestamp_ms + t0_ms;
+                    const int64_t end_t = timestamp_ms + t1_ms;
+                    char *buf = NULL;
+
+                    if (!av_strcasecmp(wctx->format, "srt")) {
+                        buf = av_asprintf(
+                            "%d\n%02" PRId64 ":%02" PRId64 ":%02" PRId64 ",%03" PRId64
+                            " --> %02" PRId64 ":%02" PRId64 ":%02" PRId64 ",%03" PRId64 "\n%s\n\n",
+                            wctx->index, start_t / 3600000,
+                            (start_t / 60000) % 60, (start_t / 1000) % 60,
+                            start_t % 1000, end_t / 3600000, (end_t / 60000) % 60,
+                            (end_t / 1000) % 60, end_t % 1000, text_cleaned);
+                        wctx->index++;
+                    } else if (!av_strcasecmp(wctx->format, "json")) {
+                        buf = av_asprintf("{\"start\":%" PRId64 ",\"end\":%" PRId64 ",\"text\":\"%s\"}\n",
+                                          start_t, end_t, text_cleaned);
+                    } else {
+                        buf = av_asprintf("%s\n", text_cleaned);
+                    }
+
+                    if (buf) {
+                        avio_write(wctx->avio_context, buf, strlen(buf));
+                        av_freep(&buf);
+                    }
+                }
+
+                av_freep(&text_cleaned);
+            }
+        }
+
+        ff_mutex_lock(&wctx->infer_mutex);
+        av_freep(&wctx->infer_result_text);
+        wctx->infer_result_text = segments_text;
+        wctx->infer_result_duration = duration;
+        wctx->infer_result_start_ms = timestamp_ms;
+        wctx->infer_pending = 0;
+        wctx->infer_done = 1;
+        ff_cond_signal(&wctx->infer_cond);
+    }
+    ff_mutex_unlock(&wctx->infer_mutex);
+
+    return NULL;
+}
+
+static void collect_result_locked(WhisperContext *wctx, AVFrame *frame)
+{
+    if (!wctx->infer_done)
+        return;
+
+    if (wctx->infer_result_text && frame) {
+        AVDictionary **metadata = &frame->metadata;
+        if (metadata) {
+            av_dict_set(metadata, "lavfi.whisper.text", wctx->infer_result_text, 0);
+            char *duration_text = av_asprintf("%f", wctx->infer_result_duration);
+            av_dict_set(metadata, "lavfi.whisper.duration", duration_text, AV_DICT_DONT_STRDUP_VAL);
+            char *start_text = av_asprintf("%" PRId64, wctx->infer_result_start_ms);
+            av_dict_set(metadata, "lavfi.whisper.start_ms", start_text, AV_DICT_DONT_STRDUP_VAL);
+        }
+    }
+
+    av_freep(&wctx->infer_result_text);
+    wctx->infer_done = 0;
+}
+
+static void submit_inference_locked(AVFilterContext *ctx, int samples)
+{
+    WhisperContext *wctx = ctx->priv;
+
+    if (samples <= 0 || samples > wctx->audio_buffer_fill_size)
+        return;
+
+    /* Ensure infer_buffer is large enough */
+    if (samples > wctx->infer_buffer_size) {
+        float *new_buf = av_realloc_array(wctx->infer_buffer, samples, sizeof(*wctx->infer_buffer));
+        if (!new_buf) {
+            av_log(ctx, AV_LOG_ERROR, "Failed to allocate infer_buffer\n");
+            return;
+        }
+        wctx->infer_buffer = new_buf;
+    }
+
+    memcpy(wctx->infer_buffer, wctx->audio_buffer, samples * sizeof(*wctx->audio_buffer));
+    wctx->infer_buffer_size = samples;
+    wctx->infer_buffer_start_ms = wctx->audio_buffer_start_ms;
+    wctx->infer_n_threads = ff_filter_get_nb_threads(ctx);
+
+    /* Compress audio_buffer: remove consumed samples */
+    const float duration = (float)samples / WHISPER_SAMPLE_RATE;
+    if (wctx->audio_buffer_fill_size > samples) {
+        memmove(wctx->audio_buffer, wctx->audio_buffer + samples,
+                (wctx->audio_buffer_fill_size - samples) * sizeof(*wctx->audio_buffer));
+        wctx->audio_buffer_start_ms += (int64_t)(duration * 1000);
+    }
+    wctx->audio_buffer_fill_size -= samples;
+    wctx->audio_buffer_vad_size = wctx->audio_buffer_fill_size;
+
+    wctx->infer_pending = 1;
+    wctx->infer_done = 0;
+    ff_cond_signal(&wctx->infer_cond);
+}
+#endif
 
 static int init(AVFilterContext *ctx)
 {
@@ -163,9 +372,32 @@ static int init(AVFilterContext *ctx)
         wctx->language = "en";
     }
 
+#if WHISPER_HAS_THREADS
+    wctx->filter_ctx = ctx;
+    wctx->infer_buffer = av_malloc_array(wctx->audio_buffer_queue_size, sizeof(*wctx->infer_buffer));
+    if (!wctx->infer_buffer)
+        return AVERROR(ENOMEM);
+    wctx->infer_buffer_size = wctx->audio_buffer_queue_size;
+
+    ff_mutex_init(&wctx->infer_mutex, NULL);
+    ff_cond_init(&wctx->infer_cond, NULL);
+
+    if (pthread_create(&wctx->infer_thread, NULL, whisper_infer_thread, wctx) != 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to create whisper inference thread\n");
+        return AVERROR(ENOMEM);
+    }
+    wctx->thread_created = 1;
+#endif
+
     av_log(ctx, AV_LOG_INFO,
-           "Whisper filter initialized: model: %s lang: %s queue: %" PRId64 " ms\n",
-           wctx->model_path, wctx->language, wctx->queue / 1000);
+           "Whisper filter initialized: model: %s lang: %s queue: %" PRId64 " ms async: %s\n",
+           wctx->model_path, wctx->language, wctx->queue / 1000,
+#if WHISPER_HAS_THREADS
+           "yes"
+#else
+           "no"
+#endif
+           );
 
     return 0;
 }
@@ -173,6 +405,23 @@ static int init(AVFilterContext *ctx)
 static void uninit(AVFilterContext *ctx)
 {
     WhisperContext *wctx = ctx->priv;
+
+#if WHISPER_HAS_THREADS
+    if (wctx->thread_created) {
+        ff_mutex_lock(&wctx->infer_mutex);
+        wctx->shutdown = 1;
+        ff_cond_signal(&wctx->infer_cond);
+        ff_mutex_unlock(&wctx->infer_mutex);
+
+        pthread_join(wctx->infer_thread, NULL);
+        wctx->thread_created = 0;
+    }
+
+    ff_mutex_destroy(&wctx->infer_mutex);
+    ff_cond_destroy(&wctx->infer_cond);
+    av_freep(&wctx->infer_buffer);
+    av_freep(&wctx->infer_result_text);
+#endif
 
     if (wctx->audio_buffer_fill_size > 0) {
         av_log(ctx, AV_LOG_WARNING,
@@ -319,6 +568,89 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     const int samples = frame->nb_samples;
     const float *input_data = (const float *) frame->data[0];
 
+#if WHISPER_HAS_THREADS
+    ff_mutex_lock(&wctx->infer_mutex);
+
+    /* Harvest previous inference result */
+    collect_result_locked(wctx, frame);
+
+    /* If buffer would overflow, try to submit or drop oldest samples */
+    if (wctx->audio_buffer_fill_size + samples > wctx->audio_buffer_queue_size) {
+        if (!wctx->infer_pending) {
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size);
+        } else if (wctx->sync) {
+            /* Sync mode: wait for inference to complete instead of dropping */
+            while (wctx->infer_pending)
+                ff_cond_wait(&wctx->infer_cond, &wctx->infer_mutex);
+            collect_result_locked(wctx, frame);
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size);
+        } else {
+            /* Inference still running — drop oldest samples to make room */
+            int drop = wctx->audio_buffer_fill_size + samples - wctx->audio_buffer_queue_size;
+            av_log(ctx, AV_LOG_WARNING,
+                   "Inference busy, dropping %d oldest samples (%.2f s)\n",
+                   drop, (float)drop / WHISPER_SAMPLE_RATE);
+            if (drop < wctx->audio_buffer_fill_size) {
+                memmove(wctx->audio_buffer, wctx->audio_buffer + drop,
+                        (wctx->audio_buffer_fill_size - drop) * sizeof(*wctx->audio_buffer));
+                wctx->audio_buffer_start_ms += (int64_t)((float)drop / WHISPER_SAMPLE_RATE * 1000);
+            }
+            wctx->audio_buffer_fill_size -= drop;
+            wctx->audio_buffer_vad_size = FFMIN(wctx->audio_buffer_vad_size, wctx->audio_buffer_fill_size);
+        }
+    }
+
+    /* Record start timestamp if buffer was empty */
+    if (!wctx->audio_buffer_fill_size)
+        wctx->audio_buffer_start_ms = av_rescale_q(frame->pts,
+                                                   (AVRational) {1000, 1},
+                                                   (AVRational) {inlink->time_base.den, inlink->time_base.num});
+
+    /* Append new samples */
+    memcpy(wctx->audio_buffer + wctx->audio_buffer_fill_size, input_data, samples * sizeof(*wctx->audio_buffer));
+    wctx->audio_buffer_fill_size += samples;
+
+    /* Check VAD or buffer-full trigger */
+    if (!wctx->infer_pending) {
+        if (wctx->ctx_vad
+            && (wctx->audio_buffer_fill_size - wctx->audio_buffer_vad_size) >=
+            av_rescale(wctx->vad_min_speech_duration + wctx->vad_min_silence_duration, WHISPER_SAMPLE_RATE, AV_TIME_BASE)) {
+            struct whisper_vad_segments *segments = whisper_vad_segments_from_samples(wctx->ctx_vad,
+                                                                                      wctx->vad_params,
+                                                                                      wctx->audio_buffer,
+                                                                                      wctx->audio_buffer_fill_size);
+            wctx->audio_buffer_vad_size = wctx->audio_buffer_fill_size;
+
+            if (!segments) {
+                av_log(ctx, AV_LOG_ERROR, "failed to detect VAD\n");
+            } else {
+                int n_segments = whisper_vad_segments_n_segments(segments);
+
+                if (n_segments > 0) {
+                    const float start_ms = whisper_vad_segments_get_segment_t0(segments, 0) * 10.0;
+                    const float end_ms = whisper_vad_segments_get_segment_t1(segments, n_segments - 1) * 10.0;
+                    int end_pos = (int) (end_ms * WHISPER_SAMPLE_RATE / 1000);
+
+                    if (end_pos <= wctx->audio_buffer_fill_size -
+                        av_rescale(wctx->vad_min_silence_duration, WHISPER_SAMPLE_RATE, AV_TIME_BASE)) {
+                        av_log(ctx, AV_LOG_INFO,
+                                "VAD detected %d segments, start: %.0f ms, end: %.0f ms (buffer: %d ms)\n",
+                                n_segments, start_ms, end_ms, 1000 * wctx->audio_buffer_fill_size / WHISPER_SAMPLE_RATE);
+                        submit_inference_locked(ctx, end_pos);
+                    }
+                }
+
+                whisper_vad_free_segments(segments);
+            }
+        } else if (wctx->audio_buffer_fill_size >= wctx->audio_buffer_queue_size) {
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size);
+        }
+    }
+
+    ff_mutex_unlock(&wctx->infer_mutex);
+
+#else /* !WHISPER_HAS_THREADS — synchronous fallback */
+
     if (wctx->audio_buffer_fill_size + samples > wctx->audio_buffer_queue_size) {
         run_transcription(ctx, frame, wctx->audio_buffer_fill_size);
     }
@@ -363,6 +695,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     } else if (wctx->audio_buffer_fill_size >= wctx->audio_buffer_queue_size)
         run_transcription(ctx, frame, wctx->audio_buffer_fill_size);
 
+#endif /* WHISPER_HAS_THREADS */
+
     wctx->next_pts = frame->pts + av_rescale_q(samples, (AVRational) {
                                                1, inlink->sample_rate}
                                                , inlink->time_base);
@@ -376,8 +710,23 @@ static int push_last_frame(AVFilterLink *outlink)
     AVFrame *frame;
     int n_out = 1;
 
-    if (ctx->is_disabled || wctx->audio_buffer_fill_size == 0)
+    if (ctx->is_disabled)
         return 0;
+
+#if WHISPER_HAS_THREADS
+    {
+        int has_work;
+        ff_mutex_lock(&wctx->infer_mutex);
+        has_work = wctx->audio_buffer_fill_size > 0 || wctx->infer_pending || wctx->infer_done;
+        ff_mutex_unlock(&wctx->infer_mutex);
+        if (!has_work)
+            return 0;
+    }
+#else
+    if (wctx->audio_buffer_fill_size == 0)
+        return 0;
+#endif
+
     frame = ff_get_audio_buffer(outlink, n_out);
     if (!frame)
         return AVERROR(ENOMEM);
@@ -390,7 +739,22 @@ static int push_last_frame(AVFilterLink *outlink)
                                        1, outlink->sample_rate}
                                        , outlink->time_base);
 
+#if WHISPER_HAS_THREADS
+    /* At EOF, we can afford to block — wait for any pending inference */
+    ff_mutex_lock(&wctx->infer_mutex);
+    while (wctx->infer_pending)
+        ff_cond_wait(&wctx->infer_cond, &wctx->infer_mutex);
+
+    /* Collect the last async result if any */
+    collect_result_locked(wctx, frame);
+    ff_mutex_unlock(&wctx->infer_mutex);
+
+    /* Process remaining audio_buffer synchronously */
+    if (wctx->audio_buffer_fill_size > 0)
+        run_transcription(ctx, frame, wctx->audio_buffer_fill_size);
+#else
     run_transcription(ctx, frame, wctx->audio_buffer_fill_size);
+#endif
 
     return ff_filter_frame(outlink, frame);
 }
@@ -460,6 +824,7 @@ static const AVOption whisper_options[] = {
     { "language", "Language for transcription ('auto' for auto-detect)", OFFSET(language), AV_OPT_TYPE_STRING, {.str = "auto"}, .flags = FLAGS },
     { "translate", "Translate from source language to English", OFFSET(translate), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = FLAGS },
     { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 3000000}, 20000, HOURS, .flags = FLAGS },
+    { "sync", "Block on inference instead of dropping samples", OFFSET(sync), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = FLAGS },
     { "use_gpu", "Use GPU for processing", OFFSET(use_gpu), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },
     { "gpu_device", "GPU device to use", OFFSET(gpu_device), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
     { "destination", "Output destination", OFFSET(destination), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
