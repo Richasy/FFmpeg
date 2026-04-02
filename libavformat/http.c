@@ -399,6 +399,57 @@ static int redirect_cache_set(HTTPContext *s, const char *source, const char *de
     return 0;
 }
 
+/**
+ * Append custom headers to the request, but skip sensitive headers
+ * (e.g. Authorization) when the current request host differs from the
+ * original URI host.  This prevents credential leakage to third-party
+ * hosts (e.g. CDN domains) after HTTP redirects, while preserving the
+ * original headers for reconnections back to the origin server.
+ *
+ * Headers are expected to be "\r\n"-terminated lines in the form
+ * "Header-Name: value\r\n".
+ */
+static void bprint_filtered_headers(AVBPrint *request, const char *headers,
+                                    int cross_origin)
+{
+    static const char *const sensitive[] = {
+        "Authorization",
+        "Proxy-Authorization",
+    };
+    const char *src;
+    int i;
+
+    if (!headers)
+        return;
+
+    if (!cross_origin) {
+        av_bprintf(request, "%s", headers);
+        return;
+    }
+
+    src = headers;
+    while (*src) {
+        const char *eol = strstr(src, "\r\n");
+        int line_len = eol ? (int)(eol - src + 2) : (int)strlen(src);
+        int strip = 0;
+
+        for (i = 0; i < FF_ARRAY_ELEMS(sensitive); i++) {
+            size_t name_len = strlen(sensitive[i]);
+            if ((size_t)line_len > name_len + 1 &&
+                !av_strncasecmp(src, sensitive[i], name_len) &&
+                (src[name_len] == ':' || src[name_len] == ' ')) {
+                strip = 1;
+                break;
+            }
+        }
+
+        if (!strip)
+            av_bprint_append_data(request, src, line_len);
+
+        src += line_len;
+    }
+}
+
 /* return non zero if error */
 static int http_open_cnx(URLContext *h, AVDictionary **options)
 {
@@ -1627,9 +1678,27 @@ static int http_connect(URLContext *h, const char *path, const char *local_path,
     if (!has_header(s->headers, "\r\nIcy-MetaData: ") && s->icy)
         av_bprintf(&request, "Icy-MetaData: 1\r\n");
 
-    /* now add in custom headers */
-    if (s->headers)
-        av_bprintf(&request, "%s", s->headers);
+    /* now add in custom headers, filtering sensitive ones on cross-origin */
+    if (s->headers) {
+        int cross_origin = 0;
+        if (s->uri) {
+            char orig_host[1024] = "";
+            char orig_hoststr[1024] = "";
+            int orig_port = 0;
+            av_url_split(NULL, 0, NULL, 0,
+                         orig_host, sizeof(orig_host), &orig_port,
+                         NULL, 0, s->uri);
+            ff_url_join(orig_hoststr, sizeof(orig_hoststr),
+                        NULL, NULL, orig_host, orig_port, NULL);
+            cross_origin = av_strcasecmp(hoststr, orig_hoststr) != 0;
+        }
+        if (cross_origin)
+            av_log(h, AV_LOG_INFO,
+                   "Cross-origin request to %s (origin: %s), "
+                   "filtering sensitive headers\n",
+                   hoststr, s->uri);
+        bprint_filtered_headers(&request, s->headers, cross_origin);
+    }
 
     if (authstr)
         av_bprintf(&request, "%s", authstr);
