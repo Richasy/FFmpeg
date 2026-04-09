@@ -47,7 +47,7 @@ typedef struct WhisperContext {
     bool translate;
     bool use_gpu;
     int gpu_device;
-    bool sync;
+    int n_processors;
     char *vad_model_path;
     float vad_threshold;
     int64_t vad_min_speech_duration;
@@ -88,8 +88,6 @@ typedef struct WhisperContext {
     int thread_created;
 
     char *infer_result_text;
-    float infer_result_duration;
-    int64_t infer_result_start_ms;
     int64_t infer_vad_speech_start_ms;  /* VAD speech start offset within buffer, -1 if no VAD */
     int infer_n_threads;
 
@@ -143,6 +141,29 @@ static int is_hallucination(const char *text)
     return 0;
 }
 
+/* Escape a string for JSON: \ → \\, " → \", control chars → \uXXXX */
+static char *json_escape(const char *s)
+{
+    size_t len = strlen(s);
+    /* Worst case: every char needs \uXXXX (6 bytes) + NUL */
+    char *out = av_malloc(len * 6 + 1);
+    if (!out)
+        return NULL;
+    char *p = out;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"')       { *p++ = '\\'; *p++ = '"'; }
+        else if (c == '\\') { *p++ = '\\'; *p++ = '\\'; }
+        else if (c == '\n') { *p++ = '\\'; *p++ = 'n'; }
+        else if (c == '\r') { *p++ = '\\'; *p++ = 'r'; }
+        else if (c == '\t') { *p++ = '\\'; *p++ = 't'; }
+        else if (c < 0x20)  { p += snprintf(p, 7, "\\u%04x", c); }
+        else                { *p++ = c; }
+    }
+    *p = '\0';
+    return out;
+}
+
 #if WHISPER_HAS_THREADS
 static void *whisper_infer_thread(void *arg)
 {
@@ -185,20 +206,16 @@ static void *whisper_infer_thread(void *arg)
         params.max_len = wctx->max_len;
         params.token_timestamps = (wctx->max_len > 0);
 
-        char *segments_text = NULL;
-        /* Use VAD speech start as the lower bound for subtitle timestamp.
-         * If VAD detected speech starting at offset X within the buffer,
-         * the subtitle should not appear before timestamp_ms + X, even if
-         * whisper reports t0=0 (which it often does for short chunks). */
-        int64_t first_segment_start_ms = (vad_speech_start_ms >= 0)
-            ? timestamp_ms + vad_speech_start_ms
-            : timestamp_ms;
-        bool got_first_segment = false;
+        char *segments_json = NULL;
 
-        if (whisper_full(wctx->ctx_wsp, params, samples, n_samples) != 0) {
+        if (whisper_full_parallel(wctx->ctx_wsp, params, samples, n_samples,
+                                  n_samples >= 5 * WHISPER_SAMPLE_RATE ? wctx->n_processors : 1) != 0) {
             av_log(ctx, AV_LOG_ERROR, "Failed to process audio with whisper.cpp (async)\n");
         } else {
             const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
+
+            /* Build JSON array: [{"s":ms,"e":ms,"t":"text"}, ...] */
+            segments_json = av_strdup("[");
 
             for (int i = 0; i < n_segments; ++i) {
                 const char *text = whisper_full_get_segment_text(wctx->ctx_wsp, i);
@@ -224,35 +241,36 @@ static void *whisper_infer_thread(void *arg)
                     continue;
                 }
 
-                const bool turn = whisper_full_get_segment_speaker_turn_next(wctx->ctx_wsp, i);
                 const int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
                 const int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+                const int64_t abs_start = timestamp_ms + t0_ms;
+                const int64_t abs_end   = timestamp_ms + t1_ms;
 
-                /* Track first valid segment's absolute start time.
-                 * Use the later of whisper's t0 and VAD speech start,
-                 * since whisper often reports t0=0 for short audio chunks. */
-                if (!got_first_segment) {
-                    int64_t whisper_start = timestamp_ms + t0_ms;
-                    if (whisper_start > first_segment_start_ms)
-                        first_segment_start_ms = whisper_start;
-                    got_first_segment = true;
+                /* Use VAD speech start as lower bound for the first segment */
+                int64_t seg_start = abs_start;
+                if (vad_speech_start_ms >= 0) {
+                    int64_t vad_abs = timestamp_ms + vad_speech_start_ms;
+                    if (seg_start < vad_abs)
+                        seg_start = vad_abs;
                 }
 
-                av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "%s]: \"%s\"\n",
-                       timestamp_ms + t0_ms, timestamp_ms + t1_ms,
-                       turn ? " (turn)" : "", text_cleaned);
+                av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "]: \"%s\"\n",
+                       abs_start, abs_end, text_cleaned);
 
-                if (segments_text) {
-                    char *new_text = av_asprintf("%s%s", segments_text, text_cleaned);
-                    av_freep(&segments_text);
-                    segments_text = new_text;
-                } else {
-                    segments_text = av_strdup(text_cleaned);
-                }
+                char *escaped = json_escape(text_cleaned);
+                char *entry = av_asprintf("%s{\"s\":%" PRId64 ",\"e\":%" PRId64 ",\"t\":\"%s\"}",
+                                          strcmp(segments_json, "[") == 0 ? "" : ",",
+                                          seg_start, abs_end, escaped);
+                av_freep(&escaped);
+
+                char *new_json = av_asprintf("%s%s", segments_json, entry);
+                av_freep(&segments_json);
+                av_freep(&entry);
+                segments_json = new_json;
 
                 if (wctx->avio_context) {
-                    const int64_t start_t = timestamp_ms + t0_ms;
-                    const int64_t end_t = timestamp_ms + t1_ms;
+                    const int64_t start_t = abs_start;
+                    const int64_t end_t = abs_end;
                     char *buf = NULL;
 
                     if (!av_strcasecmp(wctx->format, "srt")) {
@@ -279,13 +297,20 @@ static void *whisper_infer_thread(void *arg)
 
                 av_freep(&text_cleaned);
             }
+
+            /* Close JSON array */
+            char *closed = av_asprintf("%s]", segments_json);
+            av_freep(&segments_json);
+            segments_json = closed;
+
+            /* If only "[]", set to NULL (no valid segments) */
+            if (strcmp(segments_json, "[]") == 0)
+                av_freep(&segments_json);
         }
 
         ff_mutex_lock(&wctx->infer_mutex);
         av_freep(&wctx->infer_result_text);
-        wctx->infer_result_text = segments_text;
-        wctx->infer_result_duration = duration;
-        wctx->infer_result_start_ms = first_segment_start_ms;
+        wctx->infer_result_text = segments_json;
         wctx->infer_pending = 0;
         wctx->infer_done = 1;
         ff_cond_signal(&wctx->infer_cond);
@@ -302,13 +327,8 @@ static void collect_result_locked(WhisperContext *wctx, AVFrame *frame)
 
     if (wctx->infer_result_text && frame) {
         AVDictionary **metadata = &frame->metadata;
-        if (metadata) {
-            av_dict_set(metadata, "lavfi.whisper.text", wctx->infer_result_text, 0);
-            char *duration_text = av_asprintf("%f", wctx->infer_result_duration);
-            av_dict_set(metadata, "lavfi.whisper.duration", duration_text, AV_DICT_DONT_STRDUP_VAL);
-            char *start_text = av_asprintf("%" PRId64, wctx->infer_result_start_ms);
-            av_dict_set(metadata, "lavfi.whisper.start_ms", start_text, AV_DICT_DONT_STRDUP_VAL);
-        }
+        if (metadata)
+            av_dict_set(metadata, "lavfi.whisper.segments", wctx->infer_result_text, 0);
     }
 
     av_freep(&wctx->infer_result_text);
@@ -530,15 +550,14 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     params.token_timestamps = (wctx->max_len > 0);
     params.split_on_word = (wctx->max_len > 0);
 
-    if (whisper_full(wctx->ctx_wsp, params, wctx->audio_buffer, samples) != 0) {
+    if (whisper_full_parallel(wctx->ctx_wsp, params, wctx->audio_buffer, samples,
+                              samples >= 5 * WHISPER_SAMPLE_RATE ? wctx->n_processors : 1) != 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to process audio with whisper.cpp\n");
         return;
     }
 
     const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
-    char *segments_text = NULL;
-    int64_t first_segment_start_ms = timestamp_ms;
-    bool got_first_segment = false;
+    char *segments_json = av_strdup("[");
 
     for (int i = 0; i < n_segments; ++i) {
         const char *text = whisper_full_get_segment_text(wctx->ctx_wsp, i);
@@ -565,29 +584,28 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
             continue;
         }
 
-        const bool turn = whisper_full_get_segment_speaker_turn_next(wctx->ctx_wsp, i);
         const int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
         const int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+        const int64_t abs_start = timestamp_ms + t0_ms;
+        const int64_t abs_end   = timestamp_ms + t1_ms;
 
-        /* Track first valid segment's absolute start time */
-        if (!got_first_segment) {
-            first_segment_start_ms = timestamp_ms + t0_ms;
-            got_first_segment = true;
-        }
+        av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "]: \"%s\"\n",
+               abs_start, abs_end, text_cleaned);
 
-        av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "%s]: \"%s\"\n",
-               timestamp_ms + t0_ms, timestamp_ms + t1_ms, turn ? " (turn)" : "", text_cleaned);
+        char *escaped = json_escape(text_cleaned);
+        char *entry = av_asprintf("%s{\"s\":%" PRId64 ",\"e\":%" PRId64 ",\"t\":\"%s\"}",
+                                  strcmp(segments_json, "[") == 0 ? "" : ",",
+                                  abs_start, abs_end, escaped);
+        av_freep(&escaped);
 
-        if (segments_text) {
-            char *new_text = av_asprintf("%s%s", segments_text, text_cleaned);
-            av_freep(&segments_text);
-            segments_text = new_text;
-        } else
-            segments_text = av_strdup(text_cleaned);
+        char *new_json = av_asprintf("%s%s", segments_json, entry);
+        av_freep(&segments_json);
+        av_freep(&entry);
+        segments_json = new_json;
 
         if (wctx->avio_context) {
-            const int64_t start_t = timestamp_ms + t0_ms;
-            const int64_t end_t = timestamp_ms + t1_ms;
+            const int64_t start_t = abs_start;
+            const int64_t end_t = abs_end;
             char *buf = NULL;
 
             if (!av_strcasecmp(wctx->format, "srt")) {
@@ -614,15 +632,16 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
         av_freep(&text_cleaned);
     }
 
+    /* Close JSON array */
+    char *closed = av_asprintf("%s]", segments_json);
+    av_freep(&segments_json);
+    segments_json = closed;
+
     AVDictionary **metadata = &frame->metadata;
-    if (metadata && segments_text) {
-        av_dict_set(metadata, "lavfi.whisper.text", segments_text, 0);
-        char *duration_text = av_asprintf("%f", duration);
-        av_dict_set(metadata, "lavfi.whisper.duration", duration_text, AV_DICT_DONT_STRDUP_VAL);
-        char *start_text = av_asprintf("%" PRId64, first_segment_start_ms);
-        av_dict_set(metadata, "lavfi.whisper.start_ms", start_text, AV_DICT_DONT_STRDUP_VAL);
+    if (metadata && strcmp(segments_json, "[]") != 0) {
+        av_dict_set(metadata, "lavfi.whisper.segments", segments_json, 0);
     }
-    av_freep(&segments_text);
+    av_freep(&segments_json);
 
     if (wctx->audio_buffer_fill_size > samples) {
         memcpy(wctx->audio_buffer, wctx->audio_buffer + samples,
@@ -652,25 +671,15 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     if (wctx->audio_buffer_fill_size + samples > wctx->audio_buffer_queue_size) {
         if (!wctx->infer_pending) {
             submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
-        } else if (wctx->sync) {
-            /* Sync mode: wait for inference to complete instead of dropping */
+        } else {
+            /* Inference still running — wait for it to complete, then submit
+             * current buffer.  Blocking here is fine: the caller is either in
+             * sync mode or a background lookahead thread, so stalling does not
+             * affect real-time playback. */
             while (wctx->infer_pending)
                 ff_cond_wait(&wctx->infer_cond, &wctx->infer_mutex);
             collect_result_locked(wctx, frame);
             submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
-        } else {
-            /* Inference still running — drop oldest samples to make room */
-            int drop = wctx->audio_buffer_fill_size + samples - wctx->audio_buffer_queue_size;
-            av_log(ctx, AV_LOG_WARNING,
-                   "Inference busy, dropping %d oldest samples (%.2f s)\n",
-                   drop, (float)drop / WHISPER_SAMPLE_RATE);
-            if (drop < wctx->audio_buffer_fill_size) {
-                memmove(wctx->audio_buffer, wctx->audio_buffer + drop,
-                        (wctx->audio_buffer_fill_size - drop) * sizeof(*wctx->audio_buffer));
-                wctx->audio_buffer_start_ms += (int64_t)((float)drop / WHISPER_SAMPLE_RATE * 1000);
-            }
-            wctx->audio_buffer_fill_size -= drop;
-            wctx->audio_buffer_vad_size = FFMIN(wctx->audio_buffer_vad_size, wctx->audio_buffer_fill_size);
         }
     }
 
@@ -897,10 +906,10 @@ static const AVOption whisper_options[] = {
     { "model", "Path to the whisper.cpp model file", OFFSET(model_path), AV_OPT_TYPE_STRING,.flags = FLAGS },
     { "language", "Language for transcription ('auto' for auto-detect)", OFFSET(language), AV_OPT_TYPE_STRING, {.str = "auto"}, .flags = FLAGS },
     { "translate", "Translate from source language to English", OFFSET(translate), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = FLAGS },
-    { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 3000000}, 20000, HOURS, .flags = FLAGS },
-    { "sync", "Block on inference instead of dropping samples", OFFSET(sync), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = FLAGS },
+    { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 10000000}, 20000, HOURS, .flags = FLAGS },
     { "use_gpu", "Use GPU for processing", OFFSET(use_gpu), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },
     { "gpu_device", "GPU device to use", OFFSET(gpu_device), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
+    { "n_processors", "Number of parallel processors for transcription", OFFSET(n_processors), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 16, .flags = FLAGS },
     { "destination", "Output destination", OFFSET(destination), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
     { "format", "Output format (text|srt|json)", OFFSET(format), AV_OPT_TYPE_STRING, {.str = "text"},.flags = FLAGS },
     { "max_len", "Max segment length in characters", OFFSET(max_len), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
