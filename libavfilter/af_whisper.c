@@ -207,6 +207,15 @@ static void *whisper_infer_thread(void *arg)
         params.max_len = wctx->max_len;
         params.token_timestamps = (wctx->max_len > 0);
 
+        /* Adaptive audio_ctx: whisper's encoder always processes 30 s of mel
+         * spectrogram regardless of input length, so short VAD segments waste
+         * 5–6× the encoder compute.  Cap audio_ctx to roughly the actual
+         * audio length (50 mel frames per second, plus a small margin), with
+         * the upstream max of 1500 (= 30 s).  Setting audio_ctx = 0 means
+         * "use full 30 s", which is the default. */
+        const int n_samples_ms = (int)((int64_t)n_samples * 1000 / WHISPER_SAMPLE_RATE);
+        params.audio_ctx = FFMIN(1500, (n_samples_ms / 20) + 16);
+
         char *segments_json = NULL;
 
         if (whisper_full_parallel(wctx->ctx_wsp, params, samples, n_samples,
@@ -551,6 +560,12 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     params.max_len = wctx->max_len;
     params.token_timestamps = (wctx->max_len > 0);
     params.split_on_word = (wctx->max_len > 0);
+
+    /* Adaptive audio_ctx (see whisper_infer_thread for rationale). */
+    {
+        const int n_samples_ms = (int)((int64_t)samples * 1000 / WHISPER_SAMPLE_RATE);
+        params.audio_ctx = FFMIN(1500, (n_samples_ms / 20) + 16);
+    }
 
     if (whisper_full_parallel(wctx->ctx_wsp, params, wctx->audio_buffer, samples,
                               samples >= 5 * WHISPER_SAMPLE_RATE ? wctx->n_processors : 1) != 0) {
@@ -911,7 +926,7 @@ static const AVOption whisper_options[] = {
     { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 10000000}, 20000, HOURS, .flags = FLAGS },
     { "use_gpu", "Use GPU for processing", OFFSET(use_gpu), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },
     { "gpu_device", "GPU device to use", OFFSET(gpu_device), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
-    { "n_processors", "Number of parallel processors for transcription", OFFSET(n_processors), AV_OPT_TYPE_INT, {.i64 = 2}, 1, 16, .flags = FLAGS },
+    { "n_processors", "Number of parallel processors for transcription (>1 duplicates the encoder pass and is usually slower; kept for compatibility)", OFFSET(n_processors), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 16, .flags = FLAGS },
     { "destination", "Output destination", OFFSET(destination), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
     { "format", "Output format (text|srt|json)", OFFSET(format), AV_OPT_TYPE_STRING, {.str = "text"},.flags = FLAGS },
     { "max_len", "Max segment length in characters", OFFSET(max_len), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
