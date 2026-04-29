@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <whisper.h>
 #include <ggml-backend.h>
@@ -392,20 +393,39 @@ static int init(AVFilterContext *ctx)
 
     static AVOnce init_static_once = AV_ONCE_INIT;
     if (wctx->backend_path && wctx->backend_path[0]) {
-        // Caller provided an explicit ggml backend dll path.
-        // Skip the auto-scan (which probes exe dir + cwd for ggml-{name}-*.dll
-        // and is unreliable when the host bundles backends in a sub-directory),
-        // and load exactly the requested one.
-        ggml_backend_reg_t reg = ggml_backend_load(wctx->backend_path);
-        if (!reg) {
-            av_log(ctx, AV_LOG_WARNING,
-                   "Failed to load ggml backend from '%s', falling back to "
-                   "auto load_all (CPU may be the only available device).\n",
-                   wctx->backend_path);
-            ff_thread_once(&init_static_once, ggml_backend_load_all);
-        } else {
+        // Caller provided an explicit ggml backend dll path. Treat its
+        // PARENT DIRECTORY as the search dir for ALL ggml-*.dll backends
+        // (CPU + GPU): with GGML_BACKEND_DL=ON, ggml-cpu.dll is no longer
+        // statically linked into ggml-base.dll and must be loaded too,
+        // otherwise whisper has no compute backend at all.
+        // ggml_backend_load_all_from_path scans the directory for known
+        // backends (cpu/vulkan/cuda/...) and registers each one found.
+        char dir_buf[1024];
+        av_strlcpy(dir_buf, wctx->backend_path, sizeof(dir_buf));
+        char *sep = strrchr(dir_buf, '/');
+#ifdef _WIN32
+        char *sep2 = strrchr(dir_buf, '\\');
+        if (sep2 && (!sep || sep2 > sep)) sep = sep2;
+#endif
+        if (sep) {
+            *sep = '\0';
             av_log(ctx, AV_LOG_INFO,
-                   "Loaded ggml backend from '%s'.\n", wctx->backend_path);
+                   "Loading ggml backends from directory '%s' (derived from "
+                   "backend_path='%s').\n", dir_buf, wctx->backend_path);
+            ggml_backend_load_all_from_path(dir_buf);
+        } else {
+            // No directory separator: fall back to single-dll load.
+            ggml_backend_reg_t reg = ggml_backend_load(wctx->backend_path);
+            if (!reg) {
+                av_log(ctx, AV_LOG_WARNING,
+                       "Failed to load ggml backend from '%s', falling back to "
+                       "auto load_all (CPU may be the only available device).\n",
+                       wctx->backend_path);
+                ff_thread_once(&init_static_once, ggml_backend_load_all);
+            } else {
+                av_log(ctx, AV_LOG_INFO,
+                       "Loaded ggml backend from '%s'.\n", wctx->backend_path);
+            }
         }
     } else {
         ff_thread_once(&init_static_once, ggml_backend_load_all);
