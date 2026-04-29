@@ -23,6 +23,7 @@
 #include <stdlib.h>
 
 #include <whisper.h>
+#include <ggml-backend.h>
 
 #include "libavutil/avutil.h"
 #include "libavutil/opt.h"
@@ -48,6 +49,7 @@ typedef struct WhisperContext {
     bool translate;
     bool use_gpu;
     int gpu_device;
+    char *backend_path;
     int n_processors;
     char *vad_model_path;
     float vad_threshold;
@@ -389,7 +391,25 @@ static int init(AVFilterContext *ctx)
     WhisperContext *wctx = ctx->priv;
 
     static AVOnce init_static_once = AV_ONCE_INIT;
-    ff_thread_once(&init_static_once, ggml_backend_load_all);
+    if (wctx->backend_path && wctx->backend_path[0]) {
+        // Caller provided an explicit ggml backend dll path.
+        // Skip the auto-scan (which probes exe dir + cwd for ggml-{name}-*.dll
+        // and is unreliable when the host bundles backends in a sub-directory),
+        // and load exactly the requested one.
+        ggml_backend_reg_t reg = ggml_backend_load(wctx->backend_path);
+        if (!reg) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "Failed to load ggml backend from '%s', falling back to "
+                   "auto load_all (CPU may be the only available device).\n",
+                   wctx->backend_path);
+            ff_thread_once(&init_static_once, ggml_backend_load_all);
+        } else {
+            av_log(ctx, AV_LOG_INFO,
+                   "Loaded ggml backend from '%s'.\n", wctx->backend_path);
+        }
+    } else {
+        ff_thread_once(&init_static_once, ggml_backend_load_all);
+    }
 
     whisper_log_set(cb_log, ctx);
 
@@ -926,6 +946,7 @@ static const AVOption whisper_options[] = {
     { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 10000000}, 20000, HOURS, .flags = FLAGS },
     { "use_gpu", "Use GPU for processing", OFFSET(use_gpu), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },
     { "gpu_device", "GPU device to use", OFFSET(gpu_device), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
+    { "backend_path", "Explicit path to a ggml backend dynamic library to load (skips auto-scan)", OFFSET(backend_path), AV_OPT_TYPE_STRING, {.str = NULL}, .flags = FLAGS },
     { "n_processors", "Number of parallel processors for transcription (>1 duplicates the encoder pass and is usually slower; kept for compatibility)", OFFSET(n_processors), AV_OPT_TYPE_INT, {.i64 = 1}, 1, 16, .flags = FLAGS },
     { "destination", "Output destination", OFFSET(destination), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
     { "format", "Output format (text|srt|json)", OFFSET(format), AV_OPT_TYPE_STRING, {.str = "text"},.flags = FLAGS },
