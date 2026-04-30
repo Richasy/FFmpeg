@@ -516,11 +516,30 @@ static void submit_inference_locked(AVFilterContext *ctx, int samples, int64_t v
 }
 #endif
 
+static char g_backend_load_dir[1024];
+
+static void load_backends_from_dir_once_cb(void)
+{
+    ggml_backend_load_all_from_path(g_backend_load_dir);
+}
+
 static int init(AVFilterContext *ctx)
 {
     WhisperContext *wctx = ctx->priv;
 
-    static AVOnce init_static_once = AV_ONCE_INIT;
+    /* ggml's backend registry is a process-wide singleton.  Calling
+     * ggml_backend_load_all / ggml_backend_load_all_from_path more than
+     * once corrupts it: previously-registered backends keep callbacks
+     * pointing into now-freed loggers/contexts (whisper_log_set was bound
+     * to the previous AVFilterContext), and the next log emission
+     * dereferences a stale pointer.  This manifests as a crash inside
+     * ggml_log_internal the *second* time the user enables Whisper
+     * subtitles in the same process.  Guard every load path with
+     * AV_ONCE_INIT so backend registration runs exactly once. */
+    static AVOnce init_static_once       = AV_ONCE_INIT;
+    static AVOnce init_static_once_dir   = AV_ONCE_INIT;
+    static AVOnce init_static_once_file  = AV_ONCE_INIT;
+
     if (wctx->backend_path && wctx->backend_path[0]) {
         // Caller provided an explicit ggml backend dll path. Treat its
         // PARENT DIRECTORY as the search dir for ALL ggml-*.dll backends
@@ -541,20 +560,17 @@ static int init(AVFilterContext *ctx)
             av_log(ctx, AV_LOG_INFO,
                    "Loading ggml backends from directory '%s' (derived from "
                    "backend_path='%s').\n", dir_buf, wctx->backend_path);
-            ggml_backend_load_all_from_path(dir_buf);
+            av_strlcpy(g_backend_load_dir, dir_buf, sizeof(g_backend_load_dir));
+            ff_thread_once(&init_static_once_dir, load_backends_from_dir_once_cb);
         } else {
             // No directory separator: fall back to single-dll load.
-            ggml_backend_reg_t reg = ggml_backend_load(wctx->backend_path);
-            if (!reg) {
-                av_log(ctx, AV_LOG_WARNING,
-                       "Failed to load ggml backend from '%s', falling back to "
-                       "auto load_all (CPU may be the only available device).\n",
-                       wctx->backend_path);
-                ff_thread_once(&init_static_once, ggml_backend_load_all);
-            } else {
-                av_log(ctx, AV_LOG_INFO,
-                       "Loaded ggml backend from '%s'.\n", wctx->backend_path);
-            }
+            // ggml_backend_load is also a one-shot global registration —
+            // the same crash applies if it runs more than once.
+            ff_thread_once(&init_static_once_file, ggml_backend_load_all);
+            (void)ggml_backend_load(wctx->backend_path);
+            av_log(ctx, AV_LOG_INFO,
+                   "Loaded ggml backend from '%s' (or fell back to auto).\n",
+                   wctx->backend_path);
         }
     } else {
         ff_thread_once(&init_static_once, ggml_backend_load_all);
