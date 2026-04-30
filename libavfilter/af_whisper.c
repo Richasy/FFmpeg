@@ -95,6 +95,20 @@ typedef struct WhisperContext {
     int64_t infer_vad_speech_start_ms;  /* VAD speech start offset within buffer, -1 if no VAD */
     int infer_n_threads;
 
+    /* All VAD-detected speech ranges within the inference buffer, used to
+     * snap whisper's per-segment timestamps onto real speech windows.
+     * Whisper's t0/t1 for individual segments are notoriously unreliable
+     * when the input contains silence around the speech (it tends to place
+     * the timestamp earlier than the actual onset, which makes subtitles
+     * pop up several seconds before the corresponding voice).  By clamping
+     * each whisper segment to its best-overlapping VAD range we get
+     * subtitles that align with what the user actually hears.
+     * Offsets are in ms, relative to infer_buffer_start_ms. */
+    int64_t *infer_vad_starts_ms;
+    int64_t *infer_vad_ends_ms;
+    int infer_vad_n;
+    int infer_vad_cap;
+
     AVFilterContext *filter_ctx;
 #endif
 } WhisperContext;
@@ -190,6 +204,26 @@ static void *whisper_infer_thread(void *arg)
         int64_t timestamp_ms = wctx->infer_buffer_start_ms;
         int64_t vad_speech_start_ms = wctx->infer_vad_speech_start_ms;
         int n_threads = wctx->infer_n_threads;
+
+        /* Snapshot the VAD segment list onto the stack/heap so we can read
+         * it without holding the lock. Filter_frame won't touch the array
+         * while infer_pending is set, but a stable snapshot keeps the
+         * snapping code straightforward. */
+        int n_vad = wctx->infer_vad_n;
+        int64_t *vad_starts = NULL;
+        int64_t *vad_ends   = NULL;
+        if (n_vad > 0) {
+            vad_starts = av_malloc_array(n_vad, sizeof(*vad_starts));
+            vad_ends   = av_malloc_array(n_vad, sizeof(*vad_ends));
+            if (vad_starts && vad_ends) {
+                memcpy(vad_starts, wctx->infer_vad_starts_ms, n_vad * sizeof(*vad_starts));
+                memcpy(vad_ends,   wctx->infer_vad_ends_ms,   n_vad * sizeof(*vad_ends));
+            } else {
+                av_freep(&vad_starts);
+                av_freep(&vad_ends);
+                n_vad = 0;
+            }
+        }
         ff_mutex_unlock(&wctx->infer_mutex);
 
         /* Run whisper inference without lock held */
@@ -254,18 +288,65 @@ static void *whisper_infer_thread(void *arg)
                     continue;
                 }
 
-                const int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
-                const int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+                int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
+                int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+
+                /* Snap [t0, t1] (relative to inference buffer start) to the
+                 * VAD speech segment with the largest overlap.  This fixes
+                 * the "subtitle appears seconds before the speech" problem:
+                 * whisper's per-segment timestamps are computed from its
+                 * decoder's attention and frequently drift earlier than the
+                 * actual voice onset when the input contains leading or
+                 * inter-segment silence.  We trust VAD's edges instead. */
+                if (n_vad > 0) {
+                    int best = -1;
+                    int64_t best_overlap = 0;
+                    for (int v = 0; v < n_vad; v++) {
+                        int64_t lo = FFMAX(t0_ms, vad_starts[v]);
+                        int64_t hi = FFMIN(t1_ms, vad_ends[v]);
+                        int64_t ov = hi > lo ? hi - lo : 0;
+                        if (ov > best_overlap) {
+                            best_overlap = ov;
+                            best = v;
+                        }
+                    }
+                    if (best < 0) {
+                        /* No overlap at all — whisper hallucinated a segment
+                         * outside any detected speech window.  Fall back to
+                         * the nearest VAD segment by midpoint distance so
+                         * the subtitle at least aligns with *some* real
+                         * speech rather than floating in silence. */
+                        int64_t mid = (t0_ms + t1_ms) / 2;
+                        int64_t best_dist = INT64_MAX;
+                        for (int v = 0; v < n_vad; v++) {
+                            int64_t vmid = (vad_starts[v] + vad_ends[v]) / 2;
+                            int64_t d = mid > vmid ? mid - vmid : vmid - mid;
+                            if (d < best_dist) {
+                                best_dist = d;
+                                best = v;
+                            }
+                        }
+                    }
+                    if (best >= 0) {
+                        int64_t vs = vad_starts[best];
+                        int64_t ve = vad_ends[best];
+                        /* Pull the start forward to the VAD onset; cap the
+                         * end with a small pad so the subtitle lingers a
+                         * bit past the spoken phrase but doesn't bleed
+                         * into the next VAD region. */
+                        if (t0_ms < vs) t0_ms = vs;
+                        if (t0_ms > ve) t0_ms = vs;  /* odd whisper t0 */
+                        int64_t end_cap = ve + 200;  /* 200 ms tail */
+                        if (t1_ms > end_cap) t1_ms = end_cap;
+                        if (t1_ms < t0_ms + 200) t1_ms = t0_ms + 200;
+                    }
+                } else if (vad_speech_start_ms >= 0 && t0_ms < vad_speech_start_ms) {
+                    /* Backward-compat path (no segment list available) */
+                    t0_ms = vad_speech_start_ms;
+                }
+
                 const int64_t abs_start = timestamp_ms + t0_ms;
                 const int64_t abs_end   = timestamp_ms + t1_ms;
-
-                /* Use VAD speech start as lower bound for the first segment */
-                int64_t seg_start = abs_start;
-                if (vad_speech_start_ms >= 0) {
-                    int64_t vad_abs = timestamp_ms + vad_speech_start_ms;
-                    if (seg_start < vad_abs)
-                        seg_start = vad_abs;
-                }
 
                 av_log(ctx, AV_LOG_DEBUG, "  [%" PRId64 "-%" PRId64 "]: \"%s\"\n",
                        abs_start, abs_end, text_cleaned);
@@ -273,7 +354,7 @@ static void *whisper_infer_thread(void *arg)
                 char *escaped = json_escape(text_cleaned);
                 char *entry = av_asprintf("%s{\"s\":%" PRId64 ",\"e\":%" PRId64 ",\"t\":\"%s\"}",
                                           strcmp(segments_json, "[") == 0 ? "" : ",",
-                                          seg_start, abs_end, escaped);
+                                          abs_start, abs_end, escaped);
                 av_freep(&escaped);
 
                 char *new_json = av_asprintf("%s%s", segments_json, entry);
@@ -327,6 +408,15 @@ static void *whisper_infer_thread(void *arg)
         wctx->infer_pending = 0;
         wctx->infer_done = 1;
         ff_cond_signal(&wctx->infer_cond);
+
+        /* Wake the libavfilter scheduler so activate() runs even if no new
+         * input frame is currently arriving — the result must be flushed
+         * downstream as soon as possible, otherwise it sits unharvested
+         * until the next audio frame eventually shows up. */
+        ff_filter_set_ready(ctx, 100);
+
+        av_freep(&vad_starts);
+        av_freep(&vad_ends);
     }
     ff_mutex_unlock(&wctx->infer_mutex);
 
@@ -369,6 +459,12 @@ static void submit_inference_locked(AVFilterContext *ctx, int samples, int64_t v
     wctx->infer_buffer_size = samples;
     wctx->infer_buffer_start_ms = wctx->audio_buffer_start_ms;
     wctx->infer_vad_speech_start_ms = vad_speech_start_ms;
+    if (vad_speech_start_ms < 0) {
+        /* Buffer-full / flush trigger — no VAD info available, drop any
+         * stale segment list so the inference thread doesn't snap to
+         * timestamps from a previous batch. */
+        wctx->infer_vad_n = 0;
+    }
     wctx->infer_n_threads = ff_filter_get_nb_threads(ctx);
 
     /* Compress audio_buffer: remove consumed samples */
@@ -550,6 +646,8 @@ static void uninit(AVFilterContext *ctx)
     ff_cond_destroy(&wctx->infer_cond);
     av_freep(&wctx->infer_buffer);
     av_freep(&wctx->infer_result_text);
+    av_freep(&wctx->infer_vad_starts_ms);
+    av_freep(&wctx->infer_vad_ends_ms);
 #endif
 
     if (wctx->audio_buffer_fill_size > 0) {
@@ -776,6 +874,27 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                         av_log(ctx, AV_LOG_INFO,
                                 "VAD detected %d segments, start: %.0f ms, end: %.0f ms (buffer: %d ms)\n",
                                 n_segments, start_ms, end_ms, 1000 * wctx->audio_buffer_fill_size / WHISPER_SAMPLE_RATE);
+
+                        /* Snapshot every VAD speech window so the inference
+                         * thread can later snap each whisper segment to
+                         * a real speech range. */
+                        if (n_segments > wctx->infer_vad_cap) {
+                            int64_t *ns = av_realloc_array(wctx->infer_vad_starts_ms, n_segments, sizeof(*ns));
+                            int64_t *ne = av_realloc_array(wctx->infer_vad_ends_ms,   n_segments, sizeof(*ne));
+                            if (ns) wctx->infer_vad_starts_ms = ns;
+                            if (ne) wctx->infer_vad_ends_ms   = ne;
+                            if (ns && ne) wctx->infer_vad_cap = n_segments;
+                        }
+                        if (wctx->infer_vad_cap >= n_segments) {
+                            for (int v = 0; v < n_segments; v++) {
+                                wctx->infer_vad_starts_ms[v] = (int64_t)(whisper_vad_segments_get_segment_t0(segments, v) * 10.0);
+                                wctx->infer_vad_ends_ms[v]   = (int64_t)(whisper_vad_segments_get_segment_t1(segments, v) * 10.0);
+                            }
+                            wctx->infer_vad_n = n_segments;
+                        } else {
+                            wctx->infer_vad_n = 0;
+                        }
+
                         submit_inference_locked(ctx, end_pos, (int64_t)start_ms);
                     }
                 }
@@ -908,6 +1027,45 @@ static int activate(AVFilterContext *ctx)
     int status;
 
     FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
+
+#if WHISPER_HAS_THREADS
+    /* If async inference produced a result but no fresh input frame is
+     * available right now, emit a synthetic 1-sample silent frame just to
+     * carry the metadata downstream.  Without this, completed
+     * transcriptions sit in infer_result_text until the next audio frame
+     * happens to arrive (which can be seconds away when the producer is
+     * temporarily idle, e.g. demux cache not yet filled past playback,
+     * paused player, or GPU-bound while the rest of the pipeline drained). */
+    {
+        int have_result;
+        ff_mutex_lock(&wctx->infer_mutex);
+        have_result = wctx->infer_done && wctx->infer_result_text;
+        ff_mutex_unlock(&wctx->infer_mutex);
+
+        if (have_result && !wctx->eof &&
+            !ff_inlink_queued_frames(inlink) &&
+            ff_outlink_frame_wanted(outlink))
+        {
+            AVFrame *frame = ff_get_audio_buffer(outlink, 1);
+            if (frame) {
+                av_samples_set_silence(frame->extended_data, 0, 1,
+                                       frame->ch_layout.nb_channels,
+                                       frame->format);
+                frame->pts = wctx->next_pts;
+                if (wctx->next_pts != AV_NOPTS_VALUE)
+                    wctx->next_pts += av_rescale_q(1,
+                                                   (AVRational){1, outlink->sample_rate},
+                                                   outlink->time_base);
+
+                ff_mutex_lock(&wctx->infer_mutex);
+                collect_result_locked(wctx, frame);
+                ff_mutex_unlock(&wctx->infer_mutex);
+
+                return ff_filter_frame(outlink, frame);
+            }
+        }
+    }
+#endif
 
     if (!wctx->eof && ff_inlink_queued_frames(inlink)) {
         AVFrame *frame = NULL;
