@@ -299,47 +299,45 @@ static void *whisper_infer_thread(void *arg)
                  * actual voice onset when the input contains leading or
                  * inter-segment silence.  We trust VAD's edges instead. */
                 if (n_vad > 0) {
-                    int best = -1;
-                    int64_t best_overlap = 0;
+                    /* Snap to VAD speech windows.  Strategy: whisper's
+                     * timestamps are *locally* accurate inside a single
+                     * speech window (the decoder attention behaves well
+                     * around real voiced frames) but routinely drift
+                     * earlier when whisper extends into silence.  So:
+                     *
+                     *   - If t0 lies inside a VAD window, KEEP it (this
+                     *     allows several whisper segments to coexist
+                     *     within one window without collapsing onto the
+                     *     same start time).
+                     *   - If t0 lies in a silence gap before window i,
+                     *     push it forward to window[i].start.
+                     *   - If t0 is past every window, fall back to the
+                     *     last window's end.
+                     *
+                     * Symmetric clamp for t1: cap it at the latest window
+                     * that begins at or before t1, plus a 200 ms tail. */
+                    int idx0 = -1;
                     for (int v = 0; v < n_vad; v++) {
-                        int64_t lo = FFMAX(t0_ms, vad_starts[v]);
-                        int64_t hi = FFMIN(t1_ms, vad_ends[v]);
-                        int64_t ov = hi > lo ? hi - lo : 0;
-                        if (ov > best_overlap) {
-                            best_overlap = ov;
-                            best = v;
-                        }
+                        if (t0_ms < vad_ends[v]) { idx0 = v; break; }
                     }
-                    if (best < 0) {
-                        /* No overlap at all — whisper hallucinated a segment
-                         * outside any detected speech window.  Fall back to
-                         * the nearest VAD segment by midpoint distance so
-                         * the subtitle at least aligns with *some* real
-                         * speech rather than floating in silence. */
-                        int64_t mid = (t0_ms + t1_ms) / 2;
-                        int64_t best_dist = INT64_MAX;
-                        for (int v = 0; v < n_vad; v++) {
-                            int64_t vmid = (vad_starts[v] + vad_ends[v]) / 2;
-                            int64_t d = mid > vmid ? mid - vmid : vmid - mid;
-                            if (d < best_dist) {
-                                best_dist = d;
-                                best = v;
-                            }
-                        }
+                    if (idx0 < 0) {
+                        t0_ms = vad_ends[n_vad - 1];
+                    } else if (t0_ms < vad_starts[idx0]) {
+                        t0_ms = vad_starts[idx0];
                     }
-                    if (best >= 0) {
-                        int64_t vs = vad_starts[best];
-                        int64_t ve = vad_ends[best];
-                        /* Pull the start forward to the VAD onset; cap the
-                         * end with a small pad so the subtitle lingers a
-                         * bit past the spoken phrase but doesn't bleed
-                         * into the next VAD region. */
-                        if (t0_ms < vs) t0_ms = vs;
-                        if (t0_ms > ve) t0_ms = vs;  /* odd whisper t0 */
-                        int64_t end_cap = ve + 200;  /* 200 ms tail */
-                        if (t1_ms > end_cap) t1_ms = end_cap;
-                        if (t1_ms < t0_ms + 200) t1_ms = t0_ms + 200;
+
+                    int idx1 = -1;
+                    for (int v = n_vad - 1; v >= 0; v--) {
+                        if (vad_starts[v] <= t1_ms) { idx1 = v; break; }
                     }
+                    if (idx1 < 0) {
+                        t1_ms = t0_ms + 200;
+                    } else {
+                        int64_t cap = vad_ends[idx1] + 200;
+                        if (t1_ms > cap) t1_ms = cap;
+                    }
+
+                    if (t1_ms < t0_ms + 200) t1_ms = t0_ms + 200;
                 } else if (vad_speech_start_ms >= 0 && t0_ms < vad_speech_start_ms) {
                     /* Backward-compat path (no segment list available) */
                     t0_ms = vad_speech_start_ms;
@@ -438,6 +436,47 @@ static void collect_result_locked(WhisperContext *wctx, AVFrame *frame)
     wctx->infer_done = 0;
 }
 
+/* Run Silero VAD on [audio_buffer .. audio_buffer + n_samples) and store
+ * every detected speech window into wctx->infer_vad_starts_ms/ends_ms.
+ * Returns the start of the first speech window in ms (suitable for the
+ * legacy vad_speech_start_ms parameter), or -1 if no segments. */
+static int64_t populate_vad_segments_locked(AVFilterContext *ctx, int n_samples)
+{
+    WhisperContext *wctx = ctx->priv;
+
+    wctx->infer_vad_n = 0;
+    if (!wctx->ctx_vad || n_samples <= 0)
+        return -1;
+
+    struct whisper_vad_segments *segments =
+        whisper_vad_segments_from_samples(wctx->ctx_vad, wctx->vad_params,
+                                          wctx->audio_buffer, n_samples);
+    if (!segments)
+        return -1;
+
+    int n = whisper_vad_segments_n_segments(segments);
+    int64_t first_start = -1;
+    if (n > 0) {
+        if (n > wctx->infer_vad_cap) {
+            int64_t *ns = av_realloc_array(wctx->infer_vad_starts_ms, n, sizeof(*ns));
+            int64_t *ne = av_realloc_array(wctx->infer_vad_ends_ms,   n, sizeof(*ne));
+            if (ns) wctx->infer_vad_starts_ms = ns;
+            if (ne) wctx->infer_vad_ends_ms   = ne;
+            if (ns && ne) wctx->infer_vad_cap = n;
+        }
+        if (wctx->infer_vad_cap >= n) {
+            for (int v = 0; v < n; v++) {
+                wctx->infer_vad_starts_ms[v] = (int64_t)(whisper_vad_segments_get_segment_t0(segments, v) * 10.0);
+                wctx->infer_vad_ends_ms[v]   = (int64_t)(whisper_vad_segments_get_segment_t1(segments, v) * 10.0);
+            }
+            wctx->infer_vad_n = n;
+            first_start = wctx->infer_vad_starts_ms[0];
+        }
+    }
+    whisper_vad_free_segments(segments);
+    return first_start;
+}
+
 static void submit_inference_locked(AVFilterContext *ctx, int samples, int64_t vad_speech_start_ms)
 {
     WhisperContext *wctx = ctx->priv;
@@ -459,12 +498,6 @@ static void submit_inference_locked(AVFilterContext *ctx, int samples, int64_t v
     wctx->infer_buffer_size = samples;
     wctx->infer_buffer_start_ms = wctx->audio_buffer_start_ms;
     wctx->infer_vad_speech_start_ms = vad_speech_start_ms;
-    if (vad_speech_start_ms < 0) {
-        /* Buffer-full / flush trigger — no VAD info available, drop any
-         * stale segment list so the inference thread doesn't snap to
-         * timestamps from a previous batch. */
-        wctx->infer_vad_n = 0;
-    }
     wctx->infer_n_threads = ff_filter_get_nb_threads(ctx);
 
     /* Compress audio_buffer: remove consumed samples */
@@ -825,7 +858,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
     /* If buffer would overflow, try to submit or drop oldest samples */
     if (wctx->audio_buffer_fill_size + samples > wctx->audio_buffer_queue_size) {
         if (!wctx->infer_pending) {
-            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
+            int64_t fs = populate_vad_segments_locked(ctx, wctx->audio_buffer_fill_size);
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, fs);
         } else {
             /* Inference still running — wait for it to complete, then submit
              * current buffer.  Blocking here is fine: the caller is either in
@@ -834,7 +868,8 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
             while (wctx->infer_pending)
                 ff_cond_wait(&wctx->infer_cond, &wctx->infer_mutex);
             collect_result_locked(wctx, frame);
-            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
+            int64_t fs = populate_vad_segments_locked(ctx, wctx->audio_buffer_fill_size);
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, fs);
         }
     }
 
@@ -902,7 +937,14 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                 whisper_vad_free_segments(segments);
             }
         } else if (wctx->audio_buffer_fill_size >= wctx->audio_buffer_queue_size) {
-            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
+            /* Buffer-full trigger: continuous speech kept the VAD-edge
+             * trigger above from firing.  Run VAD anyway so the inference
+             * thread can snap whisper's per-segment timestamps; without
+             * VAD info, every subtitle in this 30-second batch falls back
+             * to whisper's heuristic t0/t1 which routinely drifts earlier
+             * than the actual voice onset. */
+            int64_t fs = populate_vad_segments_locked(ctx, wctx->audio_buffer_fill_size);
+            submit_inference_locked(ctx, wctx->audio_buffer_fill_size, fs);
         }
     }
 
