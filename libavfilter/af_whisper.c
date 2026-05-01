@@ -540,6 +540,19 @@ static int init(AVFilterContext *ctx)
     static AVOnce init_static_once_dir   = AV_ONCE_INIT;
     static AVOnce init_static_once_file  = AV_ONCE_INIT;
 
+    /* Bind log callbacks BEFORE loading any ggml backend dlls. Otherwise the
+     * verbose diagnostics emitted while ggml_backend_load_all_from_path scans
+     * the directory and tries to register Vulkan/CUDA/CPU backends are
+     * silently dropped, and we cannot tell whether the GPU backend actually
+     * loaded or whisper.cpp fell back to CPU.
+     *
+     * NOTE: ggml's backend layer logs through ggml_log_set, NOT
+     * whisper_log_set. We have to register both — whisper_log_set captures
+     * messages from whisper_init/whisper_full, ggml_log_set captures messages
+     * from ggml_backend_load* and from the Vulkan/CUDA backend probes. */
+    ggml_log_set(cb_log, ctx);
+    whisper_log_set(cb_log, ctx);
+
     if (wctx->backend_path && wctx->backend_path[0]) {
         // Caller provided an explicit ggml backend dll path. Treat its
         // PARENT DIRECTORY as the search dir for ALL ggml-*.dll backends
@@ -575,8 +588,6 @@ static int init(AVFilterContext *ctx)
     } else {
         ff_thread_once(&init_static_once, ggml_backend_load_all);
     }
-
-    whisper_log_set(cb_log, ctx);
 
     // Init whisper context
     if (!wctx->model_path) {
