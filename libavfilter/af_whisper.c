@@ -116,7 +116,7 @@ typedef struct WhisperContext {
 /* Remember the av_log level chosen for the previous ggml line so that
  * GGML_LOG_LEVEL_CONT (continuation lines emitted as separate calls by
  * ggml-backend-reg.cpp / Vulkan backend probes) inherits it. */
-static int s_last_cb_av_log_level = AV_LOG_VERBOSE;
+static int s_last_cb_av_log_level = AV_LOG_INFO;
 
 static void cb_log(enum ggml_log_level level, const char *text, void *user_data)
 {
@@ -132,19 +132,22 @@ static void cb_log(enum ggml_log_level level, const char *text, void *user_data)
     case GGML_LOG_LEVEL_INFO:
         /* ggml's "INFO" is critical backend diagnostics
          * ("loaded vulkan backend from ...", "ggml_vulkan: Found N
-         * devices"). Map to AV_LOG_VERBOSE so it surfaces under mpv
-         * msg-level=ffmpeg=v — AV_LOG_DEBUG would be filtered out. */
-        av_log_level = AV_LOG_VERBOSE;
+         * devices"). mpv's av_log_level_to_mp_level maps AV_LOG_INFO to
+         * MSGL_V (visible under msg-level=ffmpeg=v), but AV_LOG_VERBOSE
+         * to MSGL_DEBUG and AV_LOG_DEBUG to MSGL_TRACE — both filtered
+         * out at "v". Use AV_LOG_INFO so the diagnostics actually reach
+         * the user's log. */
+        av_log_level = AV_LOG_INFO;
         break;
     case GGML_LOG_LEVEL_DEBUG:
-        av_log_level = AV_LOG_DEBUG;
+        av_log_level = AV_LOG_VERBOSE;
         break;
     case GGML_LOG_LEVEL_CONT:
         av_log_level = s_last_cb_av_log_level;
         break;
     case GGML_LOG_LEVEL_NONE:
     default:
-        av_log_level = AV_LOG_VERBOSE;
+        av_log_level = AV_LOG_INFO;
         break;
     }
     if (level != GGML_LOG_LEVEL_CONT)
