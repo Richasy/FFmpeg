@@ -62,6 +62,26 @@ typedef struct WhisperContext {
     char *format;
     int max_len;
 
+    /* DTW token-level timestamps + media-time soft trigger.
+     *
+     * When dtw is on, whisper.cpp uses the encoder cross-attention QK
+     * matrices to align each token to its audio frame, producing far
+     * more accurate per-segment t0/t1 than the legacy heuristic ones.
+     * This makes the legacy "VAD-snap" path unnecessary for the common
+     * case (subtitles that pop up several seconds before the actual
+     * voice onset).
+     *
+     * When no vad_model is configured, inference is triggered purely
+     * on media-time accumulated in audio_buffer (step_ms), with a hard
+     * upper bound (max_chunk_ms). Wall-clock is intentionally NOT used:
+     * whisper-lookahead pipelines are decoupled from playback rate, so
+     * any wall-clock-based trigger drifts unpredictably.
+     */
+    int  dtw;
+    char *dtw_aheads_name;
+    int64_t step_ms;        /* AV_OPT_TYPE_DURATION → microseconds */
+    int64_t max_chunk_ms;   /* AV_OPT_TYPE_DURATION → microseconds */
+
     struct whisper_context *ctx_wsp;
     struct whisper_vad_context *ctx_vad;
     struct whisper_vad_params vad_params;
@@ -269,7 +289,33 @@ static void *whisper_infer_thread(void *arg)
         params.print_realtime = 0;
         params.print_timestamps = 0;
         params.max_len = wctx->max_len;
-        params.token_timestamps = (wctx->max_len > 0);
+        /* DTW reads its alignment from per-token timestamps, which whisper.cpp
+         * only computes when token_timestamps is on.  When max_len > 0 we
+         * also wrap segments on word boundaries for nicer subtitle splits. */
+        params.token_timestamps = wctx->dtw || (wctx->max_len > 0);
+        params.split_on_word    = (wctx->max_len > 0);
+
+        /* Hallucination-suppression knobs.  Most of these match upstream
+         * defaults today, but we write them explicitly so that future
+         * upstream default changes don't silently regress us:
+         *   no_context        — never seed the decoder with previous text;
+         *                       avoids one bad chunk poisoning the next.
+         *   suppress_blank    — drop standalone blank tokens at chunk start.
+         *   suppress_nst      — drop "non-speech" tokens like [Music],
+         *                       (laughter), <inaudible>; OFF by default
+         *                       upstream, which is why long BGM segments
+         *                       leak [Music] subtitles today.
+         *   temperature_inc / entropy_thold / logprob_thold / no_speech_thold
+         *                     — the OpenAI fall-back gauntlet that rejects
+         *                       low-confidence segments instead of emitting
+         *                       hallucinated text. */
+        params.no_context     = true;
+        params.suppress_blank = true;
+        params.suppress_nst   = true;
+        params.temperature_inc = 0.2f;
+        params.entropy_thold   = 2.4f;
+        params.logprob_thold   = -1.0f;
+        params.no_speech_thold = 0.6f;
 
         /* Adaptive audio_ctx: whisper's encoder always processes 30 s of mel
          * spectrogram regardless of input length, so short VAD segments waste
@@ -550,6 +596,77 @@ static void load_backends_from_dir_once_cb(void)
     ggml_backend_load_all_from_path(g_backend_load_dir);
 }
 
+/* Map a model file path or an explicit aheads name to a whisper.cpp
+ * alignment-heads preset.  When name is "auto" (or NULL/empty) we sniff
+ * the basename of model_path; otherwise the name is matched directly.
+ *
+ * Returns WHISPER_AHEADS_N_TOP_MOST (with dtw_n_top=6 chosen by the caller)
+ * as the catch-all fallback when no specific preset applies, and logs a
+ * warning so the user's model filename can be inspected later. */
+static enum whisper_alignment_heads_preset
+resolve_dtw_aheads_preset(AVFilterContext *ctx, const char *model_path, const char *name)
+{
+    char buf[256];
+    const char *src = (name && name[0]) ? name : "auto";
+
+    if (av_strcasecmp(src, "auto") == 0) {
+        if (!model_path || !model_path[0]) {
+            av_log(ctx, AV_LOG_WARNING,
+                   "dtw_aheads=auto but no model path; falling back to N_TOP_MOST,n=6\n");
+            return WHISPER_AHEADS_N_TOP_MOST;
+        }
+        const char *base = strrchr(model_path, '/');
+        const char *base2 = strrchr(model_path, '\\');
+        if (base2 > base) base = base2;
+        base = base ? base + 1 : model_path;
+        size_t n = strlen(base);
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        for (size_t i = 0; i < n; i++)
+            buf[i] = (base[i] >= 'A' && base[i] <= 'Z') ? (base[i] + 32) : base[i];
+        buf[n] = 0;
+    } else {
+        size_t n = strlen(src);
+        if (n >= sizeof(buf)) n = sizeof(buf) - 1;
+        for (size_t i = 0; i < n; i++)
+            buf[i] = (src[i] >= 'A' && src[i] <= 'Z') ? (src[i] + 32) : src[i];
+        buf[n] = 0;
+    }
+
+    /* Order matters: longest / most-specific first. */
+    if (strstr(buf, "large-v3-turbo") || strstr(buf, "large_v3_turbo") ||
+        strstr(buf, "v3-turbo")       || strstr(buf, "v3_turbo")       ||
+        strstr(buf, "turbo"))
+        return WHISPER_AHEADS_LARGE_V3_TURBO;
+    if (strstr(buf, "large-v3") || strstr(buf, "large_v3"))
+        return WHISPER_AHEADS_LARGE_V3;
+    if (strstr(buf, "large-v2") || strstr(buf, "large_v2"))
+        return WHISPER_AHEADS_LARGE_V2;
+    if (strstr(buf, "large-v1") || strstr(buf, "large_v1") || strstr(buf, "large"))
+        return WHISPER_AHEADS_LARGE_V1;
+    if (strstr(buf, "medium.en") || strstr(buf, "medium-en") || strstr(buf, "medium_en"))
+        return WHISPER_AHEADS_MEDIUM_EN;
+    if (strstr(buf, "medium"))
+        return WHISPER_AHEADS_MEDIUM;
+    if (strstr(buf, "small.en") || strstr(buf, "small-en") || strstr(buf, "small_en"))
+        return WHISPER_AHEADS_SMALL_EN;
+    if (strstr(buf, "small"))
+        return WHISPER_AHEADS_SMALL;
+    if (strstr(buf, "base.en") || strstr(buf, "base-en") || strstr(buf, "base_en"))
+        return WHISPER_AHEADS_BASE_EN;
+    if (strstr(buf, "base"))
+        return WHISPER_AHEADS_BASE;
+    if (strstr(buf, "tiny.en") || strstr(buf, "tiny-en") || strstr(buf, "tiny_en"))
+        return WHISPER_AHEADS_TINY_EN;
+    if (strstr(buf, "tiny"))
+        return WHISPER_AHEADS_TINY;
+
+    av_log(ctx, AV_LOG_WARNING,
+           "dtw_aheads=%s did not match any built-in preset (model='%s'); "
+           "falling back to N_TOP_MOST,n=6 (DTW alignment quality may be reduced).\n",
+           src, model_path ? model_path : "");
+    return WHISPER_AHEADS_N_TOP_MOST;
+}
+
 static int init(AVFilterContext *ctx)
 {
     WhisperContext *wctx = ctx->priv;
@@ -626,14 +743,45 @@ static int init(AVFilterContext *ctx)
     params.use_gpu = wctx->use_gpu;
     params.gpu_device = wctx->gpu_device;
 
+    /* DTW token-level timestamps: configured at context init time.
+     * whisper.cpp silently disables DTW when flash_attn is on
+     * (src/whisper.cpp: see "dtw_token_timestamps is not supported with
+     * flash_attn"), so we explicitly turn flash_attn off here whenever
+     * the user wants DTW.  This costs a small amount of attention
+     * throughput but is required for the alignment heads to be wired. */
+    if (wctx->dtw) {
+        const enum whisper_alignment_heads_preset preset =
+            resolve_dtw_aheads_preset(ctx, wctx->model_path, wctx->dtw_aheads_name);
+        params.dtw_token_timestamps = true;
+        params.dtw_aheads_preset = preset;
+        if (preset == WHISPER_AHEADS_N_TOP_MOST)
+            params.dtw_n_top = 6;
+        params.flash_attn = false;
+        av_log(ctx, AV_LOG_INFO,
+               "Whisper DTW enabled: aheads_preset=%d (flash_attn forced off)\n",
+               (int)preset);
+    }
+
     wctx->ctx_wsp = whisper_init_from_file_with_params(wctx->model_path, params);
     if (wctx->ctx_wsp == NULL) {
         av_log(ctx, AV_LOG_ERROR, "Failed to initialize whisper context from model: %s\n", wctx->model_path);
         return AVERROR(EIO);
     }
 
-    // Init buffer
-    wctx->audio_buffer_queue_size = av_rescale(wctx->queue, WHISPER_SAMPLE_RATE, AV_TIME_BASE);
+    // Init buffer.  When soft-trigger is active (DTW + no VAD), the user's
+    // queue value can be larger than max_chunk_ms; cap the buffer to
+    // max_chunk_ms so the overflow path enforces the hard upper bound on
+    // chunk size, otherwise large queue values lead to arbitrarily-long
+    // single-shot inferences.
+    int64_t effective_queue_us = wctx->queue;
+    if (wctx->dtw && !wctx->vad_model_path &&
+        wctx->max_chunk_ms > 0 && wctx->max_chunk_ms < effective_queue_us) {
+        av_log(ctx, AV_LOG_INFO,
+               "Capping buffer to max_chunk_ms=%" PRId64 " ms (queue was %" PRId64 " ms)\n",
+               wctx->max_chunk_ms / 1000, effective_queue_us / 1000);
+        effective_queue_us = wctx->max_chunk_ms;
+    }
+    wctx->audio_buffer_queue_size = av_rescale(effective_queue_us, WHISPER_SAMPLE_RATE, AV_TIME_BASE);
     wctx->audio_buffer = av_malloc_array(wctx->audio_buffer_queue_size, sizeof(*wctx->audio_buffer));
     if (!wctx->audio_buffer)
         return AVERROR(ENOMEM);
@@ -783,8 +931,17 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     params.print_realtime = 0;
     params.print_timestamps = 0;
     params.max_len = wctx->max_len;
-    params.token_timestamps = (wctx->max_len > 0);
+    params.token_timestamps = wctx->dtw || (wctx->max_len > 0);
     params.split_on_word = (wctx->max_len > 0);
+
+    /* See whisper_infer_thread for the rationale behind these knobs. */
+    params.no_context     = true;
+    params.suppress_blank = true;
+    params.suppress_nst   = true;
+    params.temperature_inc = 0.2f;
+    params.entropy_thold   = 2.4f;
+    params.logprob_thold   = -1.0f;
+    params.no_speech_thold = 0.6f;
 
     /* Adaptive audio_ctx (see whisper_infer_thread for rationale). */
     {
@@ -989,6 +1146,21 @@ static int filter_frame(AVFilterLink *inlink, AVFrame *frame)
                 }
 
                 whisper_vad_free_segments(segments);
+            }
+        } else if (!wctx->ctx_vad) {
+            /* No VAD model: use a media-time soft trigger.  We submit
+             * inference once enough audio (step_ms) has accumulated, with
+             * a hard upper bound (max_chunk_ms / queue) handled by the
+             * overflow path above.  This deliberately ignores wall-clock:
+             * the lookahead pipeline decodes faster than realtime, so a
+             * wall-clock-based trigger would produce arbitrarily-large
+             * chunks during a "fast catchup" burst. */
+            const int64_t fill_ms = av_rescale(wctx->audio_buffer_fill_size,
+                                               1000, WHISPER_SAMPLE_RATE);
+            const int64_t step_ms_local =
+                wctx->step_ms > 0 ? wctx->step_ms / 1000 : 0;
+            if (step_ms_local > 0 && fill_ms >= step_ms_local) {
+                submit_inference_locked(ctx, wctx->audio_buffer_fill_size, -1);
             }
         } else if (wctx->audio_buffer_fill_size >= wctx->audio_buffer_queue_size) {
             /* Buffer-full trigger: continuous speech kept the VAD-edge
@@ -1225,7 +1397,11 @@ static const AVOption whisper_options[] = {
     { "destination", "Output destination", OFFSET(destination), AV_OPT_TYPE_STRING, {.str = ""}, .flags = FLAGS },
     { "format", "Output format (text|srt|json)", OFFSET(format), AV_OPT_TYPE_STRING, {.str = "text"},.flags = FLAGS },
     { "max_len", "Max segment length in characters", OFFSET(max_len), AV_OPT_TYPE_INT, {.i64 = 0}, 0, INT_MAX, .flags = FLAGS },
-    { "vad_model", "Path to the VAD model file", OFFSET(vad_model_path), AV_OPT_TYPE_STRING,.flags = FLAGS },
+    { "dtw", "Use whisper.cpp DTW token-level timestamps for accurate per-segment t0/t1 (replaces VAD-based timestamp snapping; forces flash_attn off)", OFFSET(dtw), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },
+    { "dtw_aheads", "Alignment-heads preset for DTW: auto|tiny|tiny_en|base|base_en|small|small_en|medium|medium_en|large_v1|large_v2|large_v3|large_v3_turbo (auto = sniff model filename)", OFFSET(dtw_aheads_name), AV_OPT_TYPE_STRING, {.str = "auto"}, .flags = FLAGS },
+    { "step_ms", "Soft-trigger step (run inference every N ms of accumulated audio) when no vad_model is configured", OFFSET(step_ms), AV_OPT_TYPE_DURATION, {.i64 = 10000000}, 1000000, HOURS, .flags = FLAGS },
+    { "max_chunk_ms", "Hard upper bound on a single inference chunk when no vad_model is configured (caps the audio buffer)", OFFSET(max_chunk_ms), AV_OPT_TYPE_DURATION, {.i64 = 30000000}, 5000000, HOURS, .flags = FLAGS },
+    { "vad_model", "Path to the VAD model file (legacy fallback; leave unset to use DTW-only timestamps)", OFFSET(vad_model_path), AV_OPT_TYPE_STRING,.flags = FLAGS },
     { "vad_threshold", "VAD threshold", OFFSET(vad_threshold), AV_OPT_TYPE_FLOAT, {.dbl = 0.5}, 0.0, 1.0, .flags = FLAGS },
     { "vad_min_speech_duration", "Minimum speech duration for VAD", OFFSET(vad_min_speech_duration), AV_OPT_TYPE_DURATION, {.i64 = 100000}, 20000, HOURS, .flags = FLAGS },
     { "vad_min_silence_duration", "Minimum silence duration for VAD", OFFSET(vad_min_silence_duration), AV_OPT_TYPE_DURATION, {.i64 = 500000}, 0, HOURS, .flags = FLAGS },
