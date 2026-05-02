@@ -229,6 +229,79 @@ static char *json_escape(const char *s)
     return out;
 }
 
+/* Find the first frame in the chunk where audio energy crosses a
+ * threshold sustained for at least min_run_ms.  Returns the onset offset
+ * in milliseconds relative to the chunk start, or -1 if either:
+ *   - the chunk already starts with significant audio (no leading silence
+ *     to snap away), or
+ *   - no clear onset can be located.
+ *
+ * Used as a post-DTW correction for the FIRST emitted segment of each
+ * chunk only.  Whisper.cpp's DTW alignment uses cross-attention which
+ * gets diffuse when a chunk begins with silence, so the first segment
+ * frequently lands several seconds before the actual voice onset.  This
+ * helper recovers the onset cheaply (one pass over the samples, ~1 ms
+ * on 30 s of audio) without bringing back a neural VAD. */
+static int64_t find_energy_onset_ms(const float *samples, int n_samples)
+{
+    if (!samples || n_samples < WHISPER_SAMPLE_RATE / 50)  /* < 20 ms */
+        return -1;
+
+    const int frame_len = WHISPER_SAMPLE_RATE / 100;  /* 10 ms = 160 samples @ 16 kHz */
+    const int n_frames = n_samples / frame_len;
+    if (n_frames < 20)
+        return -1;
+
+    float *frame_e = av_malloc_array(n_frames, sizeof(*frame_e));
+    if (!frame_e)
+        return -1;
+
+    float head_energy = 0.f;
+    float peak_energy = 0.f;
+    const int head_frames = FFMIN(20, n_frames);  /* first 200 ms */
+
+    for (int f = 0; f < n_frames; f++) {
+        const float *p = samples + (size_t)f * frame_len;
+        float sum = 0.f;
+        for (int s = 0; s < frame_len; s++)
+            sum += p[s] * p[s];
+        frame_e[f] = sum / frame_len;
+        if (f < head_frames) head_energy += frame_e[f];
+        if (frame_e[f] > peak_energy) peak_energy = frame_e[f];
+    }
+    head_energy /= head_frames;
+
+    /* Mostly silent — nothing to snap. */
+    if (peak_energy <= 1e-7f) {
+        av_free(frame_e);
+        return -1;
+    }
+
+    /* Chunk already starts loud relative to its peak (within ~6 dB):
+     * the first segment timestamp is probably already correct, leave it. */
+    if (head_energy >= 0.25f * peak_energy) {
+        av_free(frame_e);
+        return -1;
+    }
+
+    const float thresh = FFMAX(4.f * head_energy, 0.04f * peak_energy);
+    const int min_run = 10;  /* sustained ≥ 100 ms above threshold */
+    int run = 0;
+    int onset_frame = -1;
+    for (int f = 0; f < n_frames; f++) {
+        if (frame_e[f] >= thresh) {
+            if (run == 0) onset_frame = f;
+            run++;
+            if (run >= min_run) break;
+        } else {
+            run = 0;
+            onset_frame = -1;
+        }
+    }
+    av_free(frame_e);
+    return onset_frame >= 0 ? (int64_t)onset_frame * 10 : -1;
+}
+
 #if WHISPER_HAS_THREADS
 static void *whisper_infer_thread(void *arg)
 {
@@ -334,6 +407,14 @@ static void *whisper_infer_thread(void *arg)
         } else {
             const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
 
+            /* Compute energy onset once per chunk for the no-VAD DTW path.
+             * Used to push the FIRST segment forward when DTW aligned it
+             * into the leading silence (a common DTW failure mode). */
+            int64_t energy_onset_ms = -1;
+            if (wctx->dtw && n_vad == 0)
+                energy_onset_ms = find_energy_onset_ms(samples, n_samples);
+            int first_emitted = 1;
+
             /* Build JSON array: [{"s":ms,"e":ms,"t":"text"}, ...] */
             segments_json = av_strdup("[");
 
@@ -414,7 +495,22 @@ static void *whisper_infer_thread(void *arg)
                 } else if (vad_speech_start_ms >= 0 && t0_ms < vad_speech_start_ms) {
                     /* Backward-compat path (no segment list available) */
                     t0_ms = vad_speech_start_ms;
+                } else if (first_emitted && energy_onset_ms >= 0 &&
+                           t0_ms + 100 < energy_onset_ms) {
+                    /* DTW + no VAD: only the first emitted segment of the
+                     * chunk gets the energy-onset correction.  We never
+                     * push it backward (>=) and we require at least 100 ms
+                     * of detected leading silence to avoid jittering on
+                     * already-correct timestamps.  Subsequent segments
+                     * keep DTW's relative spacing. */
+                    av_log(ctx, AV_LOG_DEBUG,
+                           "  energy-onset snap: %" PRId64 " ms → %" PRId64 " ms\n",
+                           t0_ms, energy_onset_ms);
+                    int64_t shift = energy_onset_ms - t0_ms;
+                    t0_ms += shift;
+                    if (t1_ms < t0_ms + 200) t1_ms = t0_ms + 200;
                 }
+                first_emitted = 0;
 
                 const int64_t abs_start = timestamp_ms + t0_ms;
                 const int64_t abs_end   = timestamp_ms + t1_ms;
@@ -956,6 +1052,14 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     }
 
     const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
+
+    /* Compute energy onset once for the no-VAD DTW path; applied to the
+     * first emitted segment to fix DTW's leading-silence drift. */
+    int64_t energy_onset_ms = -1;
+    if (wctx->dtw && !wctx->ctx_vad)
+        energy_onset_ms = find_energy_onset_ms(wctx->audio_buffer, samples);
+    int first_emitted = 1;
+
     char *segments_json = av_strdup("[");
 
     for (int i = 0; i < n_segments; ++i) {
@@ -983,8 +1087,17 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
             continue;
         }
 
-        const int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
-        const int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+        int64_t t0_ms = whisper_full_get_segment_t0(wctx->ctx_wsp, i) * 10;
+        int64_t t1_ms = whisper_full_get_segment_t1(wctx->ctx_wsp, i) * 10;
+        if (first_emitted && energy_onset_ms >= 0 &&
+            t0_ms + 100 < energy_onset_ms) {
+            av_log(ctx, AV_LOG_DEBUG,
+                   "  energy-onset snap: %" PRId64 " ms → %" PRId64 " ms\n",
+                   t0_ms, energy_onset_ms);
+            t0_ms = energy_onset_ms;
+            if (t1_ms < t0_ms + 200) t1_ms = t0_ms + 200;
+        }
+        first_emitted = 0;
         const int64_t abs_start = timestamp_ms + t0_ms;
         const int64_t abs_end   = timestamp_ms + t1_ms;
 
