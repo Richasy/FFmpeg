@@ -313,9 +313,16 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
 
     if (!s->hd) {
         s->nb_connections++;
+        av_log(h, AV_LOG_VERBOSE,
+               "opening new %s connection to %s (#%d, redirects=%d, off=%" PRIu64 ")\n",
+               lower_proto, buf, s->nb_connections, s->nb_redirects, s->off);
         err = ffurl_open_whitelist(&s->hd, buf, AVIO_FLAG_READ_WRITE,
                                    &h->interrupt_callback, options,
                                    h->protocol_whitelist, h->protocol_blacklist, h);
+    } else {
+        av_log(h, AV_LOG_VERBOSE,
+               "reusing existing %s connection to %s (off=%" PRIu64 ")\n",
+               lower_proto, buf, s->off);
     }
 
 end:
@@ -465,6 +472,8 @@ redo:
 
     cached = redirect_cache_get(s);
     if (cached) {
+        av_log(h, AV_LOG_VERBOSE,
+               "redirect cache hit: %s -> %s\n", s->location, cached);
         if (redirects++ >= s->max_redirects)
             return AVERROR(EIO);
 
@@ -2207,7 +2216,8 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
 
     /* try to reuse existing connection for small seeks */
     uint64_t remaining = s->range_end - old_off - old_buf_size;
-    if (s->hd && !s->willclose && s->range_end && remaining <= ffurl_get_short_seek(h)) {
+    int short_seek_h = ffurl_get_short_seek(h);
+    if (s->hd && !s->willclose && s->range_end && remaining <= short_seek_h) {
         /* drain remaining data left on the wire from previous request */
         av_log(h, AV_LOG_DEBUG, "Soft-seeking to offset %"PRIu64" by draining "
                "%"PRIu64" remaining byte(s)\n", s->off, remaining);
@@ -2222,6 +2232,10 @@ static int64_t http_seek_internal(URLContext *h, int64_t off, int whence, int fo
         }
     } else {
         /* can't soft seek; always open new connection */
+        av_log(h, AV_LOG_VERBOSE,
+               "hard seek from %" PRIu64 " to %" PRIu64 " (willclose=%d,"
+               " range_end=%" PRIu64 ", short_seek=%d)\n",
+               old_off, s->off, s->willclose, s->range_end, short_seek_h);
         old_hd = s->hd;
         s->hd = NULL;
     }
@@ -2255,9 +2269,19 @@ static int http_get_file_handle(URLContext *h)
 static int http_get_short_seek(URLContext *h)
 {
     HTTPContext *s = h->priv_data;
+    int v;
     if (s->short_seek_size >= 1)
         return s->short_seek_size;
-    return ffurl_get_short_seek(s->hd);
+    /* Underlying transports (e.g. tcp on Windows) may return AVERROR(ENOSYS)
+     * which is a small negative value. Callers in http_seek_internal compare
+     * this against an unsigned remaining byte count, where the implicit
+     * int->uint64_t conversion turns a negative value into a huge positive
+     * number and bypasses the soft-seek guard, causing arbitrary GB-scale
+     * forward seeks to silently drain the entire file on the keep-alive
+     * connection. Clamp negative results to 0 so the soft-seek path is only
+     * taken when there is a real positive threshold. */
+    v = ffurl_get_short_seek(s->hd);
+    return v < 0 ? 0 : v;
 }
 
 #define HTTP_CLASS(flavor)                          \
