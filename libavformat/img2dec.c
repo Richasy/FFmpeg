@@ -21,6 +21,7 @@
  */
 
 #include "config_components.h"
+#include "libavutil/attributes.h"
 
 #define _DEFAULT_SOURCE
 #define _BSD_SOURCE
@@ -769,11 +770,11 @@ static int jpeg_probe(const AVProbeData *p)
         case APP0:
             if (c == APP0 && AV_RL32(&b[i + 4]) == MKTAG('J','F','I','F'))
                 got_header = 1;
-            /* fallthrough */
+            av_fallthrough;
         case APP1:
             if (c == APP1 && AV_RL32(&b[i + 4]) == MKTAG('E','x','i','f'))
                 got_header = 1;
-            /* fallthrough */
+            av_fallthrough;
         case APP2:
         case APP3:
         case APP4:
@@ -1063,7 +1064,7 @@ static int pam_probe(const AVProbeData *p)
 
 static int hdr_probe(const AVProbeData *p)
 {
-    if (!memcmp(p->buf, "#?RADIANCE\n", 11))
+    if (!memcmp(p->buf, "#?RADIANCE\n", 11) || !memcmp(p->buf, "#?RGBE\n", 7))
         return AVPROBE_SCORE_MAX;
     return 0;
 }

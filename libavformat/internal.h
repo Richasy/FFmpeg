@@ -700,4 +700,16 @@ int ff_parse_opts_from_query_string(void *obj, const char *str, int allow_unkown
 int ff_make_codec_str(void *logctx, const AVCodecParameters *par,
                       const AVRational *frame_rate, struct AVBPrint *out);
 
+/**
+ * Allocate copy of a structure and copy contents of an AVBPrint buffer to the
+ * flexible array member of the copied struct. AVBPrint buffer is freed.
+ *
+ * @param bp pointer to an AVBprint struct
+ * @param struct_ptr pointer to the struct to be copied
+ * @param fam_offset must be offsetof(StructType, flexible_array_member)
+ * @return pointer to the newly allocated struct, NULL on allocation error or
+ *         if the AVBPrint buffer is not complete
+ */
+void *ff_bprint_finalize_as_fam(struct AVBPrint *bp, const void *struct_ptr, size_t fam_offset);
+
 #endif /* AVFORMAT_INTERNAL_H */

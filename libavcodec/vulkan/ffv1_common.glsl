@@ -100,7 +100,7 @@ struct SliceContext {
     uint slice_coding_mode;
     bool slice_reset_contexts;
 
-    u16vec4 remap_count;
+    i32vec4 remap_count;
 
     /* Decoder-only */
     uint remap;
@@ -142,20 +142,22 @@ u16vec4 get_slice_bits(in SliceContext sc)
 #ifndef FLOAT
     return u16vec4(c_bits, c_bits, c_bits, c_bits);
 #else
-    u16vec4 bits = sc.remap_count;
+    u32vec4 cnt = sc.remap_count;
 #if defined(ENCODE)
     if (remap_mode == 0)
 #elif defined(DECODE)
     if (sc.remap == 0)
 #endif
-        bits = u16vec4(ivec4(rct_offset, rct_offset, rct_offset, rct_offset));
+        cnt = u32vec4(uint(rct_offset), uint(rct_offset),
+                      uint(rct_offset), uint(rct_offset));
 
+    u16vec4 bits = u16vec4(cnt);
     if (sc.slice_coding_mode == 0) {
-        uint16_t max3 = max(bits[0], max(bits[1], bits[2]));
+        uint max3 = max(cnt[0], max(cnt[1], cnt[2]));
         bits = u16vec4(ceil_log2(max3),
-                       ceil_log2(bits[0] + bits[1]),
-                       ceil_log2(bits[0] + bits[2]),
-                       bits[3]);
+                       ceil_log2(cnt[0] + cnt[1]),
+                       ceil_log2(cnt[0] + cnt[2]),
+                       ceil_log2(cnt[3]));
     }
 
     return bits;
@@ -269,14 +271,19 @@ ivec2 get_pred(readonly uimage2D pred, ivec2 sp, ivec2 off,
 
 void linecache_load(readonly uimage2D src, ivec2 sp, int y, uint comp)
 {
-    if (gl_LocalInvocationID.x == 0) {
+    if (gl_LocalInvocationID.x == 0)
         linecache[0] = TYPE(0);
-    } else if (gl_LocalInvocationID.x == 1) {
+
+#ifndef GOLOMB
+    if (gl_LocalInvocationID.x == 1)
+#endif
+    {
         TYPE c = TYPE(0);
         if (y > 0)
             c = TYPE(imageLoad(src, sp + LADDR(ivec2(0, y - 1)))[comp]);
         linecache[1] = c;
     }
+
     barrier();
 }
 

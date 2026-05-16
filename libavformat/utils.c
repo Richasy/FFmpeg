@@ -684,3 +684,22 @@ int ff_parse_opts_from_query_string(void *obj, const char *str, int allow_unknow
     }
     return 0;
 }
+
+void *ff_bprint_finalize_as_fam(struct AVBPrint *bp, const void *struct_ptr, size_t fam_offset)
+{
+    if (!av_bprint_is_complete(bp)) {
+        av_bprint_finalize(bp, NULL);
+        return NULL;
+    }
+
+    uint8_t *p = av_malloc(fam_offset + bp->len);
+    if (!p) {
+        av_bprint_finalize(bp, NULL);
+        return NULL;
+    }
+    memcpy(p, struct_ptr, fam_offset);
+    memcpy(p + fam_offset, bp->str, bp->len);
+    av_bprint_finalize(bp, NULL);
+
+    return p;
+}

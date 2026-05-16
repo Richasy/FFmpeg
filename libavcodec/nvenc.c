@@ -680,7 +680,9 @@ static int nvenc_check_capabilities(AVCodecContext *avctx)
 
 #ifdef NVENC_HAVE_MVHEVC
     ctx->multiview_supported = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_MVHEVC_ENCODE) > 0;
-    if(ctx->profile == NV_ENC_HEVC_PROFILE_MULTIVIEW_MAIN && !ctx->multiview_supported) {
+    if (avctx->codec_id == AV_CODEC_ID_HEVC &&
+        ctx->profile == NV_ENC_HEVC_PROFILE_MULTIVIEW_MAIN &&
+        !ctx->multiview_supported) {
         av_log(avctx, AV_LOG_WARNING, "Multiview not supported by the device\n");
         return AVERROR(ENOSYS);
     }
@@ -2779,6 +2781,7 @@ static int process_output_surface(AVCodecContext *avctx, AVPacket *pkt, NvencSur
     switch (lock_params.pictureType) {
     case NV_ENC_PIC_TYPE_IDR:
         pkt->flags |= AV_PKT_FLAG_KEY;
+        av_fallthrough;
     case NV_ENC_PIC_TYPE_I:
         pict_type = AV_PICTURE_TYPE_I;
         break;
