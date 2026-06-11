@@ -550,11 +550,24 @@ redo:
         if (redirects++ >= s->max_redirects)
             return AVERROR(EIO);
 
+        int permanent_redirect = (s->http_code == 301 || s->http_code == 308);
+
         if (!s->expires) {
-            s->expires = (s->http_code == 301 || s->http_code == 308) ? INT64_MAX : -1;
+            s->expires = permanent_redirect ? INT64_MAX : -1;
         }
 
-        if (s->expires > time(NULL) && av_dict_count(s->redirect_cache) < MAX_CACHED_REDIRECTS) {
+        /* Only cache permanent redirects (301/308). Temporary redirects
+         * (302/303/307) routinely point to signed, single-use CDN URLs
+         * (e.g. ?sig=...&nonce=...&exp=...). Caching such a redirect and
+         * replaying it on the next reconnect/seek reuses the spent nonce,
+         * which the origin rejects with HTTP 400 and which looks like
+         * abusive traffic to the server. Re-resolving through the origin
+         * on every reconnect is the intended flow for signed URLs: the
+         * origin mints a fresh signature each time. A permanent redirect,
+         * by contrast, designates a stable new location and stays safe to
+         * cache even when honouring an explicit Cache-Control/Expires. */
+        if (permanent_redirect &&
+            s->expires > time(NULL) && av_dict_count(s->redirect_cache) < MAX_CACHED_REDIRECTS) {
             redirect_cache_set(s, s->location, s->new_location, s->expires);
         }
 
