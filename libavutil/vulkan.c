@@ -477,6 +477,17 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
 
     pool->pool_size = nb_contexts;
 
+#ifdef VK_KHR_internally_synchronized_queues
+    /* Check if the extension and its flag are actually enabled */
+    int internal_queue_sync = 0;
+    if (s->extensions & FF_VK_EXT_INTERNAL_QUEUE_SYNC) {
+        const VkPhysicalDeviceInternallySynchronizedQueuesFeaturesKHR *iqs;
+        iqs = ff_vk_find_struct(s->hwctx->device_features.pNext,
+                                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_INTERNALLY_SYNCHRONIZED_QUEUES_FEATURES_KHR);
+        internal_queue_sync = iqs && iqs->internallySynchronizedQueues;
+    }
+#endif
+
     /* Init contexts */
     for (int i = 0; i < pool->pool_size; i++) {
         FFVkExecContext *e = &pool->contexts[i];
@@ -510,9 +521,8 @@ int ff_vk_exec_pool_init(FFVulkanContext *s, AVVulkanDeviceQueueFamily *qf,
         VkDeviceQueueInfo2 qinfo = {
             .sType            = VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2,
 #ifdef VK_KHR_internally_synchronized_queues
-            .flags            = (s->extensions & FF_VK_EXT_INTERNAL_QUEUE_SYNC)
-                                    ? VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR
-                                    : 0,
+            .flags            = internal_queue_sync ?
+                                VK_DEVICE_QUEUE_CREATE_INTERNALLY_SYNCHRONIZED_BIT_KHR : 0,
 #endif
             .queueFamilyIndex = qf->idx,
             .queueIndex       = e->qi,
@@ -1608,6 +1618,14 @@ void ff_vk_set_perm(enum AVPixelFormat pix_fmt, int lut[4], int inv)
         lut[2] = 1;
         lut[3] = 3;
         break;
+    case AV_PIX_FMT_BGRA:
+    case AV_PIX_FMT_BGR0:
+        /* Stored in RGBA images, so reverse them */
+        lut[0] = 2;
+        lut[1] = 1;
+        lut[2] = 0;
+        lut[3] = 3;
+        break;
     default:
         lut[0] = 0;
         lut[1] = 1;
@@ -1671,6 +1689,15 @@ const char *ff_vk_shader_rep_fmt(enum AVPixelFormat pix_fmt,
             [FF_VK_REP_FLOAT] = "rgba16",
             [FF_VK_REP_INT] = "rgba16i",
             [FF_VK_REP_UINT] = "rgba16ui",
+        };
+        return rep_tab[rep_fmt];
+    }
+    case AV_PIX_FMT_RGBAF16: {
+        const char *rep_tab[] = {
+            [FF_VK_REP_NATIVE] = "rgba16f",
+            [FF_VK_REP_FLOAT] = "rgba16f",
+            [FF_VK_REP_INT] = "rgba32i",
+            [FF_VK_REP_UINT] = "rgba16u",
         };
         return rep_tab[rep_fmt];
     }
@@ -1882,6 +1909,12 @@ static VkFormat map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
             VK_FORMAT_UNDEFINED,
         },
         {
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_FORMAT_R16G16B16A16_SFLOAT,
+            VK_FORMAT_UNDEFINED,
+            VK_FORMAT_UNDEFINED,
+        },
+        {
             VK_FORMAT_R32G32B32A32_SFLOAT,
             VK_FORMAT_R32G32B32A32_SFLOAT,
             VK_FORMAT_UNDEFINED,
@@ -1902,8 +1935,8 @@ static VkFormat map_fmt_to_rep(VkFormat fmt, enum FFVkShaderRepFormat rep_fmt)
         {
             VK_FORMAT_R16_SFLOAT,
             VK_FORMAT_R16_SFLOAT,
-            VK_FORMAT_UNDEFINED,
-            VK_FORMAT_UNDEFINED,
+            VK_FORMAT_R16_SINT,
+            VK_FORMAT_R16_UINT,
         },
     };
 #undef REPS_FMT_PACK

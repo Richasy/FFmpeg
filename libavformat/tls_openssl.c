@@ -20,7 +20,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "libavutil/mem.h"
+#include "config_components.h"
+
 #include "network.h"
 #include "os_support.h"
 #include "libavutil/time.h"
@@ -534,8 +535,9 @@ static int url_bio_bread(BIO *b, char *buf, int len)
 {
     TLSContext *c = BIO_get_data(b);
     TLSShared *s = &c->tls_shared;
-    int ret = ffurl_read(c->tls_shared.is_dtls ? c->tls_shared.udp : c->tls_shared.tcp, buf, len);
+    int ret = ffurl_read(s->is_dtls ? s->udp : s->tcp, buf, len);
     if (ret >= 0) {
+#if CONFIG_UDP_PROTOCOL
         if (s->is_dtls && s->listen && !c->dest_addr_len) {
             int err_ret;
 
@@ -547,6 +549,7 @@ static int url_bio_bread(BIO *b, char *buf, int len)
             }
             av_log(c, AV_LOG_TRACE, "Set UDP remote addr on UDP socket, now 'connected'\n");
         }
+#endif
 
         return ret;
     }

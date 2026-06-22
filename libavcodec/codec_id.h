@@ -332,6 +332,7 @@ enum AVCodecID {
     AV_CODEC_ID_APV,
     AV_CODEC_ID_PRORES_RAW,
     AV_CODEC_ID_JPEGXS,
+    AV_CODEC_ID_WEBP_ANIM,
 
     /* various PCM "codecs" */
     AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
@@ -566,6 +567,7 @@ enum AVCodecID {
     AV_CODEC_ID_LC3,
     AV_CODEC_ID_G728,
     AV_CODEC_ID_AHX,
+    AV_CODEC_ID_APPLE_APAC,
 
     /* subtitle codecs */
     AV_CODEC_ID_FIRST_SUBTITLE = 0x17000,          ///< A dummy ID pointing at the start of subtitle codecs.

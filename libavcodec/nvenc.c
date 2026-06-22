@@ -263,8 +263,10 @@ static void nvenc_map_preset(NvencContext *ctx)
 
 static void nvenc_print_driver_requirement(AVCodecContext *avctx, int level)
 {
-#if NVENCAPI_CHECK_VERSION(13, 1)
+#if NVENCAPI_CHECK_VERSION(13, 2)
     const char *minver = "(unknown)";
+#elif NVENCAPI_CHECK_VERSION(13, 1)
+    const char *minver = "610.00";
 #elif NVENCAPI_CHECK_VERSION(13, 0)
     const char *minver = "570.0";
 #elif NVENCAPI_CHECK_VERSION(12, 2)
@@ -589,12 +591,32 @@ static int nvenc_check_capabilities(AVCodecContext *avctx)
 #ifdef NVENC_HAVE_BFRAME_REF_MODE
     tmp = (ctx->b_ref_mode >= 0) ? ctx->b_ref_mode : NV_ENC_BFRAME_REF_MODE_DISABLED;
     ret = nvenc_check_cap(avctx, NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE);
-    if (tmp == NV_ENC_BFRAME_REF_MODE_EACH && ret != 1 && ret != 3) {
-        av_log(avctx, AV_LOG_WARNING, "Each B frame as reference is not supported\n");
-        return AVERROR(ENOSYS);
-    } else if (tmp != NV_ENC_BFRAME_REF_MODE_DISABLED && ret == 0) {
-        av_log(avctx, AV_LOG_WARNING, "B frames as references are not supported\n");
-        return AVERROR(ENOSYS);
+    switch (tmp) {
+    case NV_ENC_BFRAME_REF_MODE_DISABLED:
+        break;
+    case NV_ENC_BFRAME_REF_MODE_EACH:
+        if (!(ret & 1)) {
+            av_log(avctx, AV_LOG_WARNING, "Each B frame reference mode is not supported\n");
+            return AVERROR(ENOSYS);
+        }
+        break;
+    case NV_ENC_BFRAME_REF_MODE_MIDDLE:
+        if (!(ret & 2)) {
+            av_log(avctx, AV_LOG_WARNING, "Middle B frame reference mode is not supported\n");
+            return AVERROR(ENOSYS);
+        }
+        break;
+#ifdef NVENC_HAVE_AV1_HGOP_SUPPORT
+    case NV_ENC_BFRAME_REF_MODE_HIERARCHICAL:
+        if (!(ret & 4)) {
+            av_log(avctx, AV_LOG_WARNING, "Hierarchical B frame reference mode is not supported\n");
+            return AVERROR(ENOSYS);
+        }
+        break;
+#endif
+    default:
+        av_log(avctx, AV_LOG_ERROR, "Invalid b_ref_mode value %d\n", tmp);
+        return AVERROR(EINVAL);
     }
 #else
     tmp = (ctx->b_ref_mode >= 0) ? ctx->b_ref_mode : 0;
@@ -1162,6 +1184,13 @@ static av_cold int nvenc_setup_rate_control(AVCodecContext *avctx)
 #ifdef NVENC_HAVE_QP_CHROMA_OFFSETS
     ctx->encode_config.rcParams.cbQPIndexOffset = ctx->qp_cb_offset;
     ctx->encode_config.rcParams.crQPIndexOffset = ctx->qp_cr_offset;
+
+    if (avctx->codec->id == AV_CODEC_ID_AV1 &&
+        ctx->qp_cr_offset != ctx->qp_cb_offset)
+        av_log(avctx, AV_LOG_WARNING,
+               "av1_nvenc: qp_cr_offset is currently ignored by the NVENC driver "
+               "(deltaQ_v_ac is forced equal to deltaQ_u_ac); only qp_cb_offset "
+               "takes effect.\n");
 #else
     if (ctx->qp_cb_offset || ctx->qp_cr_offset)
         av_log(avctx, AV_LOG_WARNING, "Failed setting QP CB/CR offsets, SDK 11.1 or greater required at compile time.\n");
@@ -1358,6 +1387,11 @@ static av_cold int nvenc_setup_h264_config(AVCodecContext *avctx)
         case NV_ENC_H264_PROFILE_BASELINE:
             cc->profileGUID = NV_ENC_H264_PROFILE_BASELINE_GUID;
             avctx->profile = AV_PROFILE_H264_BASELINE;
+            if (cc->frameIntervalP > 1) {
+                av_log(avctx, AV_LOG_WARNING,
+                       "B-frames are not supported by H.264 Baseline profile, disabling.\n");
+                cc->frameIntervalP = 1;
+            }
             break;
         case NV_ENC_H264_PROFILE_MAIN:
             cc->profileGUID = NV_ENC_H264_PROFILE_MAIN_GUID;
@@ -2528,7 +2562,12 @@ static void nvenc_fill_time_code(AVCodecContext *avctx, const AVFrame *frame, NV
             unsigned hh, mm, ss, ff, drop;
             ff_timecode_set_smpte(&drop, &hh, &mm, &ss, &ff, avctx->framerate, tc[i + 1], 0, 0);
 
+#ifdef NVENC_NEW_COUNTING_TYPE
+            time_code->clockTimestamp[i].countingTypeLSB = 0;
+            time_code->clockTimestamp[i].countingTypeMSB = 0;
+#else
             time_code->clockTimestamp[i].countingType = 0;
+#endif
             time_code->clockTimestamp[i].discontinuityFlag = 0;
             time_code->clockTimestamp[i].cntDroppedFrames = drop;
             time_code->clockTimestamp[i].nFrames = ff;
