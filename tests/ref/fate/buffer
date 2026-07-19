@@ -22,6 +22,17 @@ writable after ref: 0
 refcount after unref: 1
 writable after unref: 1
 
+Testing invalid av_buffer_ref()
+null ref: rejected
+detached ref: rejected
+writable query: rejected
+opaque query: rejected
+refcount query: rejected
+make writable: rejected
+realloc: rejected
+replace: rejected
+unref: cleared
+
 Testing av_buffer_make_writable()
 make_writable ret: 1
 data preserved: yes

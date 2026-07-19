@@ -142,8 +142,9 @@ void av_buffer_default_free(void *opaque, uint8_t *data);
 /**
  * Create a new reference to an AVBuffer.
  *
+ * @param buf a valid reference returned by the AVBuffer API
  * @return a new AVBufferRef referring to the same AVBuffer as buf or NULL on
- * failure.
+ * allocation failure or invalid input.
  */
 AVBufferRef *av_buffer_ref(const AVBufferRef *buf);
 

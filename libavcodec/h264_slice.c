@@ -335,6 +335,58 @@ static void color_frame(AVFrame *frame, const int c[4])
 
 static int h264_slice_header_init(H264Context *h);
 
+static int h264_validate_frame_ref(const AVCodecContext *avctx,
+                                   const H264Picture *pic,
+                                   const char *picture, int picture_index)
+{
+    const AVFrame *frame = pic->f;
+
+    if (!frame)
+        return 0;
+
+    for (int i = 0; i < FF_ARRAY_ELEMS(frame->buf); i++) {
+        const AVBufferRef *ref = frame->buf[i];
+
+        if (ref && !ref->buffer) {
+            av_log((void *)avctx, AV_LOG_ERROR,
+                   "[h264-frame-ref-invalid] picture=%s picture_index=%d "
+                   "slot=buf slot_index=%d frame=%p ref=%p format=%d "
+                   "size=%dx%d threads=%d active_thread_type=0x%x\n",
+                   picture, picture_index, i, (const void *)frame,
+                   (const void *)ref, frame->format, frame->width,
+                   frame->height, avctx->thread_count,
+                   avctx->active_thread_type);
+            return AVERROR_INVALIDDATA;
+        }
+    }
+
+    if (frame->hw_frames_ctx && !frame->hw_frames_ctx->buffer) {
+        av_log((void *)avctx, AV_LOG_ERROR,
+               "[h264-frame-ref-invalid] picture=%s picture_index=%d "
+               "slot=hw_frames_ctx frame=%p ref=%p format=%d size=%dx%d "
+               "threads=%d active_thread_type=0x%x\n",
+               picture, picture_index, (const void *)frame,
+               (const void *)frame->hw_frames_ctx, frame->format,
+               frame->width, frame->height, avctx->thread_count,
+               avctx->active_thread_type);
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (frame->opaque_ref && !frame->opaque_ref->buffer) {
+        av_log((void *)avctx, AV_LOG_ERROR,
+               "[h264-frame-ref-invalid] picture=%s picture_index=%d "
+               "slot=opaque_ref frame=%p ref=%p format=%d size=%dx%d "
+               "threads=%d active_thread_type=0x%x\n",
+               picture, picture_index, (const void *)frame,
+               (const void *)frame->opaque_ref, frame->format,
+               frame->width, frame->height, avctx->thread_count,
+               avctx->active_thread_type);
+        return AVERROR_INVALIDDATA;
+    }
+
+    return 0;
+}
+
 int ff_h264_update_thread_context(AVCodecContext *dst,
                                   const AVCodecContext *src)
 {
@@ -402,12 +454,20 @@ int ff_h264_update_thread_context(AVCodecContext *dst,
     h->droppable            = h1->droppable;
 
     for (i = 0; i < H264_MAX_PICTURE_COUNT; i++) {
+        ret = h264_validate_frame_ref(src, &h1->DPB[i], "DPB", i);
+        if (ret < 0)
+            return ret;
+
         ret = ff_h264_replace_picture(&h->DPB[i], &h1->DPB[i]);
         if (ret < 0)
             return ret;
     }
 
     h->cur_pic_ptr = REBASE_PICTURE(h1->cur_pic_ptr, h, h1);
+    ret = h264_validate_frame_ref(src, &h1->cur_pic, "cur_pic", -1);
+    if (ret < 0)
+        return ret;
+
     ret = ff_h264_replace_picture(&h->cur_pic, &h1->cur_pic);
     if (ret < 0)
         return ret;

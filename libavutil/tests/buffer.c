@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "libavutil/buffer.h"
+#include "libavutil/log.h"
 #include "libavutil/mem.h"
 
 static int custom_free_called;
@@ -123,6 +124,38 @@ int main(void)
             printf("writable after unref: %d\n", av_buffer_is_writable(buf));
         }
         av_buffer_unref(&buf);
+    }
+
+    /* invalid av_buffer_ref input */
+    printf("\nTesting invalid av_buffer_ref()\n");
+    {
+        AVBufferRef invalid = { 0 };
+        AVBufferRef *invalid_ptr = &invalid;
+        int log_level = av_log_get_level();
+
+        av_log_set_level(AV_LOG_QUIET);
+        buf  = av_buffer_ref(NULL);
+        buf2 = av_buffer_ref(&invalid);
+        int writable = av_buffer_is_writable(&invalid);
+        void *opaque = av_buffer_get_opaque(&invalid);
+        int refcount = av_buffer_get_ref_count(&invalid);
+        int make_writable = av_buffer_make_writable(&invalid_ptr);
+        int realloc_result = av_buffer_realloc(&invalid_ptr, 16);
+        int replace_result = av_buffer_replace(&invalid_ptr, &invalid);
+        av_buffer_unref(&invalid_ptr);
+        av_log_set_level(log_level);
+
+        printf("null ref: %s\n", buf ? "FAIL" : "rejected");
+        printf("detached ref: %s\n", buf2 ? "FAIL" : "rejected");
+        printf("writable query: %s\n", writable ? "FAIL" : "rejected");
+        printf("opaque query: %s\n", opaque ? "FAIL" : "rejected");
+        printf("refcount query: %s\n", refcount ? "FAIL" : "rejected");
+        printf("make writable: %s\n", make_writable < 0 ? "rejected" : "FAIL");
+        printf("realloc: %s\n", realloc_result < 0 ? "rejected" : "FAIL");
+        printf("replace: %s\n", replace_result < 0 ? "rejected" : "FAIL");
+        printf("unref: %s\n", invalid_ptr ? "FAIL" : "cleared");
+        av_buffer_unref(&buf);
+        av_buffer_unref(&buf2);
     }
 
     /* av_buffer_make_writable */

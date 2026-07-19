@@ -23,6 +23,7 @@
 #include "avassert.h"
 #include "buffer_internal.h"
 #include "common.h"
+#include "log.h"
 #include "mem.h"
 #include "thread.h"
 
@@ -100,16 +101,34 @@ AVBufferRef *av_buffer_allocz(size_t size)
     return ret;
 }
 
+static int buffer_ref_is_valid(const AVBufferRef *ref, const char *operation)
+{
+    if (ref && ref->buffer)
+        return 1;
+
+    av_log(NULL, AV_LOG_ERROR,
+           "[avbuffer-invalid] operation=%s ref=%p buffer=%p\n",
+           operation, (const void *)ref,
+           ref ? (void *)ref->buffer : NULL);
+    return 0;
+}
+
 AVBufferRef *av_buffer_ref(const AVBufferRef *buf)
 {
-    AVBufferRef *ret = av_mallocz(sizeof(*ret));
+    AVBuffer *buffer;
+    AVBufferRef *ret;
 
+    if (!buffer_ref_is_valid(buf, "ref"))
+        return NULL;
+
+    buffer = buf->buffer;
+    ret = av_mallocz(sizeof(*ret));
     if (!ret)
         return NULL;
 
     *ret = *buf;
 
-    atomic_fetch_add_explicit(&buf->buffer->refcount, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&buffer->refcount, 1, memory_order_relaxed);
 
     return ret;
 }
@@ -117,6 +136,21 @@ AVBufferRef *av_buffer_ref(const AVBufferRef *buf)
 static void buffer_replace(AVBufferRef **dst, AVBufferRef **src)
 {
     AVBuffer *b;
+
+    if (!buffer_ref_is_valid(*dst, src ? "replace-dst" : "unref")) {
+        /*
+         * The reference may already be dangling, so neither dereference nor
+         * free it. Drop it from the caller and move a replacement into place
+         * when one is available.
+         */
+        if (src) {
+            *dst = *src;
+            *src = NULL;
+        } else {
+            *dst = NULL;
+        }
+        return;
+    }
 
     b = (*dst)->buffer;
 
@@ -146,6 +180,9 @@ void av_buffer_unref(AVBufferRef **buf)
 
 int av_buffer_is_writable(const AVBufferRef *buf)
 {
+    if (!buffer_ref_is_valid(buf, "is-writable"))
+        return 0;
+
     if (buf->buffer->flags & AV_BUFFER_FLAG_READONLY)
         return 0;
 
@@ -154,17 +191,28 @@ int av_buffer_is_writable(const AVBufferRef *buf)
 
 void *av_buffer_get_opaque(const AVBufferRef *buf)
 {
+    if (!buffer_ref_is_valid(buf, "get-opaque"))
+        return NULL;
+
     return buf->buffer->opaque;
 }
 
 int av_buffer_get_ref_count(const AVBufferRef *buf)
 {
+    if (!buffer_ref_is_valid(buf, "get-ref-count"))
+        return 0;
+
     return atomic_load(&buf->buffer->refcount);
 }
 
 int av_buffer_make_writable(AVBufferRef **pbuf)
 {
-    AVBufferRef *newbuf, *buf = *pbuf;
+    AVBufferRef *newbuf, *buf;
+
+    if (!pbuf || !buffer_ref_is_valid(*pbuf, "make-writable"))
+        return AVERROR(EINVAL);
+
+    buf = *pbuf;
 
     if (av_buffer_is_writable(buf))
         return 0;
@@ -182,10 +230,16 @@ int av_buffer_make_writable(AVBufferRef **pbuf)
 
 int av_buffer_realloc(AVBufferRef **pbuf, size_t size)
 {
-    AVBufferRef *buf = *pbuf;
+    AVBufferRef *buf;
     uint8_t *tmp;
     int ret;
 
+    if (!pbuf) {
+        buffer_ref_is_valid(NULL, "realloc");
+        return AVERROR(EINVAL);
+    }
+
+    buf = *pbuf;
     if (!buf) {
         /* allocate a new buffer with av_realloc(), so it will be reallocatable
          * later */
@@ -203,7 +257,12 @@ int av_buffer_realloc(AVBufferRef **pbuf, size_t size)
         *pbuf = buf;
 
         return 0;
-    } else if (buf->size == size)
+    }
+
+    if (!buffer_ref_is_valid(buf, "realloc"))
+        return AVERROR(EINVAL);
+
+    if (buf->size == size)
         return 0;
 
     if (!(buf->buffer->flags_internal & BUFFER_FLAG_REALLOCATABLE) ||
@@ -232,11 +291,30 @@ int av_buffer_realloc(AVBufferRef **pbuf, size_t size)
 
 int av_buffer_replace(AVBufferRef **pdst, const AVBufferRef *src)
 {
-    AVBufferRef *dst = *pdst;
+    AVBufferRef *dst;
     AVBufferRef *tmp;
 
+    if (!pdst) {
+        buffer_ref_is_valid(NULL, "replace-dst");
+        return AVERROR(EINVAL);
+    }
+
+    dst = *pdst;
     if (!src) {
         av_buffer_unref(pdst);
+        return 0;
+    }
+
+    if (!buffer_ref_is_valid(src, "replace-src"))
+        return AVERROR(EINVAL);
+
+    if (dst && !buffer_ref_is_valid(dst, "replace-dst")) {
+        tmp = av_buffer_ref(src);
+        if (!tmp)
+            return AVERROR(ENOMEM);
+
+        av_buffer_unref(pdst);
+        *pdst = tmp;
         return 0;
     }
 
@@ -416,6 +494,9 @@ AVBufferRef *av_buffer_pool_get(AVBufferPool *pool)
 
 void *av_buffer_pool_buffer_get_opaque(const AVBufferRef *ref)
 {
+    if (!buffer_ref_is_valid(ref, "pool-get-opaque"))
+        return NULL;
+
     BufferPoolEntry *buf = ref->buffer->opaque;
     av_assert0(buf);
     return buf->opaque;
