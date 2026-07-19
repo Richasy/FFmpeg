@@ -791,6 +791,9 @@ static const enum AVPixelFormat mpeg1_hwaccel_pixfmt_list_420[] = {
 #if CONFIG_MPEG1_NVDEC_HWACCEL
     AV_PIX_FMT_CUDA,
 #endif
+#if CONFIG_MPEG1_NVDEC_CUARRAY_HWACCEL
+    AV_PIX_FMT_CUARRAY,
+#endif
 #if CONFIG_MPEG1_VDPAU_HWACCEL
     AV_PIX_FMT_VDPAU,
 #endif
@@ -801,6 +804,9 @@ static const enum AVPixelFormat mpeg1_hwaccel_pixfmt_list_420[] = {
 static const enum AVPixelFormat mpeg2_hwaccel_pixfmt_list_420[] = {
 #if CONFIG_MPEG2_NVDEC_HWACCEL
     AV_PIX_FMT_CUDA,
+#endif
+#if CONFIG_MPEG2_NVDEC_CUARRAY_HWACCEL
+    AV_PIX_FMT_CUARRAY,
 #endif
 #if CONFIG_MPEG2_VDPAU_HWACCEL
     AV_PIX_FMT_VDPAU,
@@ -1890,12 +1896,6 @@ static void mpeg_set_cc_format(AVCodecContext *avctx, enum Mpeg2ClosedCaptionsFo
 
         av_log(avctx, AV_LOG_DEBUG, "CC: first seen substream is %s format\n", label);
     }
-
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-    avctx->properties |= FF_CODEC_PROPERTY_CLOSED_CAPTIONS;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 }
 
 static int mpeg_decode_a53_cc(AVCodecContext *avctx,
@@ -2654,6 +2654,9 @@ const FFCodec ff_mpeg1video_decoder = {
 #if CONFIG_MPEG1_NVDEC_HWACCEL
                                HWACCEL_NVDEC(mpeg1),
 #endif
+#if CONFIG_MPEG1_NVDEC_CUARRAY_HWACCEL
+                               HWACCEL_NVDEC_CUARRAY(mpeg1),
+#endif
 #if CONFIG_MPEG1_VDPAU_HWACCEL
                                HWACCEL_VDPAU(mpeg1),
 #endif
@@ -2724,6 +2727,9 @@ const FFCodec ff_mpeg2video_decoder = {
 #endif
 #if CONFIG_MPEG2_NVDEC_HWACCEL
                         HWACCEL_NVDEC(mpeg2),
+#endif
+#if CONFIG_MPEG2_NVDEC_CUARRAY_HWACCEL
+                        HWACCEL_NVDEC_CUARRAY(mpeg2),
 #endif
 #if CONFIG_MPEG2_VAAPI_HWACCEL
                         HWACCEL_VAAPI(mpeg2),

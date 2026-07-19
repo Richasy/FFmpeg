@@ -25,6 +25,7 @@
 
 #include "libavutil/frame.h"
 #include "graph.h"
+#include "uops.h"
 
 /**
  * Global execution context for all compiled functions.
@@ -135,12 +136,16 @@ typedef struct SwsOpBackend {
     SwsBackend flags; /* Set of SWS_BACKEND_* */
 
     /**
-     * Compile an operation list to an implementation chain. May modify `ops`
-     * freely; the original list will be freed automatically by the caller.
+     * Compile an operation list to an implementation chain.
      *
      * Returns 0 or a negative error code.
      */
     int (*compile)(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out);
+
+    /**
+     * Alternative to `compile` that takes a list of micro-ops directly.
+     */
+    int (*compile_uops)(SwsContext *ctx, const SwsUOpList *uops, SwsCompiledOp *out);
 
     /**
      * If NONE, backend only supports software frames.
@@ -162,18 +167,27 @@ extern const SwsOpBackend *const ff_sws_op_backends[];
 int ff_sws_ops_compile(SwsContext *ctx, const SwsOpBackend *backend,
                        const SwsOpList *ops, SwsCompiledOp *out);
 
+enum SwsOpCompileFlags {
+    /* Automatically optimize the operations when compiling */
+    SWS_OP_FLAG_OPTIMIZE = 1 << 0,
+
+    /* Discard the compiled op lists instead of generating passes */
+    SWS_OP_FLAG_DRY_RUN = 1 << 1,
+
+    /* Split off copied/cleared planes into separate subpasses */
+    SWS_OP_FLAG_SPLIT_MEMCPY = 1 << 2,
+};
+
 /**
- * Resolves an operation list to a graph pass. The first and last operations
- * must be a read/write respectively.
+ * Resolves an operation list to a graph pass. The last op must be a write.
  *
  * @param backend Force the use of a specific backend (Optional)
  * @param ops Operations to compile. Ownership passes to this function, and
  *            will be set to NULL, even on failure.
  * @param flags Set of SwsOpCompileFlags
  * @param input The input for the compiled passes. (Optional)
- * @param output The resulting final output pass will be stored here. If NULL,
- *               no output passes are created, and any compiled functions are
- *               instead immediately freed.
+ * @param output The resulting final output pass will be stored here.
+ *               Optional if using SWS_OP_FLAG_DRY_RUN.
  */
 int ff_sws_compile_pass(SwsGraph *graph, const SwsOpBackend *backend,
                         SwsOpList **ops, int flags, SwsPass *input,

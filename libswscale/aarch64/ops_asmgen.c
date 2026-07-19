@@ -48,6 +48,7 @@
 #define av_free(p)       free(p)
 #define FFMAX(a,b) ((a) > (b) ? (a) : (b))
 #define FFMIN(a,b) ((a) > (b) ? (b) : (a))
+#define MKTAG(a,b,c,d) ((a) | ((b) << 8) | ((c) << 16) | ((unsigned)(d) << 24))
 
 static void av_freep(void *ptr)
 {
@@ -58,6 +59,17 @@ static void av_freep(void *ptr)
             free(ptr);
         *pptr = NULL;
     }
+}
+
+static void *av_memdup(const void *p, size_t size)
+{
+    void *ptr = NULL;
+    if (p) {
+        ptr = av_malloc(size);
+        if (ptr)
+            memcpy(ptr, p, size);
+    }
+    return ptr;
 }
 
 #include "libavutil/dynarray.h"
@@ -77,6 +89,8 @@ static void *av_dynarray2_add(void **tab_ptr, int *nb_ptr, size_t elem_size,
     });
     return tab_elem_data;
 }
+
+#include "libavutil/bprint.c"
 
 /*********************************************************************/
 #include "rasm.c"
@@ -449,23 +463,6 @@ static void asmgen_op_read_nibble(SwsAArch64Context *s, const SwsAArch64OpImplPa
     }
 }
 
-static void asmgen_op_read_packed_1(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
-{
-    RasmContext *r = s->rctx;
-    AArch64VecViews vl[1];
-    AArch64VecViews vh[1];
-
-    a64op_vec_views(s->vl[0], &vl[0]);
-    a64op_vec_views(s->vh[0], &vh[0]);
-
-    switch ((s->use_vh ? 0x100 : 0) | s->vec_size) {
-    case 0x008: i_ldr(r, vl[0].d,          a64op_post(s->in[0], s->vec_size * 1)); break;
-    case 0x010: i_ldr(r, vl[0].q,          a64op_post(s->in[0], s->vec_size * 1)); break;
-    case 0x108: i_ldp(r, vl[0].d, vh[0].d, a64op_post(s->in[0], s->vec_size * 2)); break;
-    case 0x110: i_ldp(r, vl[0].q, vh[0].q, a64op_post(s->in[0], s->vec_size * 2)); break;
-    }
-}
-
 static void asmgen_op_read_packed_n(SwsAArch64Context *s, const SwsAArch64OpImplParams *p, RasmOp *vx)
 {
     RasmContext *r = s->rctx;
@@ -479,13 +476,10 @@ static void asmgen_op_read_packed_n(SwsAArch64Context *s, const SwsAArch64OpImpl
 
 static void asmgen_op_read_packed(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
 {
-    if (p->mask == 0x0001) {
-        asmgen_op_read_packed_1(s, p);
-    } else {
-        asmgen_op_read_packed_n(s, p, s->vl);
-        if (s->use_vh)
-            asmgen_op_read_packed_n(s, p, s->vh);
-    }
+    av_assert0(p->mask != 0x0001);
+    asmgen_op_read_packed_n(s, p, s->vl);
+    if (s->use_vh)
+        asmgen_op_read_packed_n(s, p, s->vh);
 }
 
 static void asmgen_op_read_planar(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
@@ -574,23 +568,6 @@ static void asmgen_op_write_nibble(SwsAArch64Context *s, const SwsAArch64OpImplP
     }
 }
 
-static void asmgen_op_write_packed_1(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
-{
-    RasmContext *r = s->rctx;
-    AArch64VecViews vl[1];
-    AArch64VecViews vh[1];
-
-    a64op_vec_views(s->vl[0], &vl[0]);
-    a64op_vec_views(s->vh[0], &vh[0]);
-
-    switch ((s->use_vh ? 0x100 : 0) | s->vec_size) {
-    case 0x008: i_str(r, vl[0].d,          a64op_post(s->out[0], s->vec_size * 1)); break;
-    case 0x010: i_str(r, vl[0].q,          a64op_post(s->out[0], s->vec_size * 1)); break;
-    case 0x108: i_stp(r, vl[0].d, vh[0].d, a64op_post(s->out[0], s->vec_size * 2)); break;
-    case 0x110: i_stp(r, vl[0].q, vh[0].q, a64op_post(s->out[0], s->vec_size * 2)); break;
-    }
-}
-
 static void asmgen_op_write_packed_n(SwsAArch64Context *s, const SwsAArch64OpImplParams *p, RasmOp *vx)
 {
     RasmContext *r = s->rctx;
@@ -604,13 +581,10 @@ static void asmgen_op_write_packed_n(SwsAArch64Context *s, const SwsAArch64OpImp
 
 static void asmgen_op_write_packed(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
 {
-    if (p->mask == 0x0001) {
-        asmgen_op_write_packed_1(s, p);
-    } else {
-        asmgen_op_write_packed_n(s, p, s->vl);
-        if (s->use_vh)
-            asmgen_op_write_packed_n(s, p, s->vh);
-    }
+    av_assert0(p->mask != 0x0001);
+    asmgen_op_write_packed_n(s, p, s->vl);
+    if (s->use_vh)
+        asmgen_op_write_packed_n(s, p, s->vh);
 }
 
 static void asmgen_op_write_planar(SwsAArch64Context *s, const SwsAArch64OpImplParams *p)
@@ -1554,7 +1528,10 @@ static int asmgen(void)
         return AVERROR(ENOMEM);
 
     SwsAArch64Context s = { .rctx = rctx };
+    AVBPrint bp;
     int ret;
+
+    av_bprint_init(&bp, 0, AV_BPRINT_SIZE_UNLIMITED);
 
     /**
      * The entry point of the SwsOpFunc is the `process` function. The
@@ -1648,9 +1625,13 @@ static int asmgen(void)
     /* Print all rasm functions to stdout. */
     printf("#include \"libavutil/aarch64/asm.S\"\n");
     printf("\n");
-    ret = rasm_print(s.rctx, stdout);
+    ret = rasm_print(s.rctx, &bp);
+    if (ret < 0)
+        goto error;
+    fputs(bp.str, stdout);
 
 error:
+    av_bprint_finalize(&bp, NULL);
     rasm_free(&s.rctx);
     return ret;
 }

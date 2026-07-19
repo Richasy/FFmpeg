@@ -1741,35 +1741,6 @@ static int setup_queue_families(AVHWDeviceContext *ctx, VkDeviceCreateInfo *cd)
         };
     }
 
-#if FF_API_VULKAN_FIXED_QUEUES
-FF_DISABLE_DEPRECATION_WARNINGS
-    /* Setup deprecated fields */
-    hwctx->queue_family_index        = -1;
-    hwctx->queue_family_comp_index   = -1;
-    hwctx->queue_family_tx_index     = -1;
-    hwctx->queue_family_encode_index = -1;
-    hwctx->queue_family_decode_index = -1;
-
-#define SET_OLD_QF(field, nb_field, type)             \
-    do {                                              \
-        if (field < 0 && hwctx->qf[i].flags & type) { \
-            field = hwctx->qf[i].idx;                 \
-            nb_field = hwctx->qf[i].num;              \
-        }                                             \
-    } while (0)
-
-    for (uint32_t i = 0; i < hwctx->nb_qf; i++) {
-        SET_OLD_QF(hwctx->queue_family_index, hwctx->nb_graphics_queues, VK_QUEUE_GRAPHICS_BIT);
-        SET_OLD_QF(hwctx->queue_family_comp_index, hwctx->nb_comp_queues, VK_QUEUE_COMPUTE_BIT);
-        SET_OLD_QF(hwctx->queue_family_tx_index, hwctx->nb_tx_queues, VK_QUEUE_TRANSFER_BIT);
-        SET_OLD_QF(hwctx->queue_family_encode_index, hwctx->nb_encode_queues, VK_QUEUE_VIDEO_ENCODE_BIT_KHR);
-        SET_OLD_QF(hwctx->queue_family_decode_index, hwctx->nb_decode_queues, VK_QUEUE_VIDEO_DECODE_BIT_KHR);
-    }
-
-#undef SET_OLD_QF
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
-
     return 0;
 }
 
@@ -1947,7 +1918,6 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
     VkQueueFamilyProperties2 *qf;
     VkQueueFamilyVideoPropertiesKHR *qf_vid;
     VkPhysicalDeviceExternalSemaphoreInfo ext_sem_props_info;
-    int graph_index, comp_index, tx_index, enc_index, dec_index;
 
     /* Set device extension flags */
     for (int i = 0; i < hwctx->nb_enabled_dev_extensions; i++) {
@@ -2059,77 +2029,6 @@ static int vulkan_device_init(AVHWDeviceContext *ctx)
             }
         }
     }
-
-#if FF_API_VULKAN_FIXED_QUEUES
-FF_DISABLE_DEPRECATION_WARNINGS
-    graph_index = hwctx->nb_graphics_queues ? hwctx->queue_family_index : -1;
-    comp_index  = hwctx->nb_comp_queues ? hwctx->queue_family_comp_index : -1;
-    tx_index    = hwctx->nb_tx_queues ? hwctx->queue_family_tx_index : -1;
-    dec_index   = hwctx->nb_decode_queues ? hwctx->queue_family_decode_index : -1;
-    enc_index   = hwctx->nb_encode_queues ? hwctx->queue_family_encode_index : -1;
-
-#define CHECK_QUEUE(type, required, fidx, ctx_qf, qc)                                           \
-    do {                                                                                        \
-        if (ctx_qf < 0 && required) {                                                           \
-            av_log(ctx, AV_LOG_ERROR, "%s queue family is required, but marked as missing"      \
-                   " in the context!\n", type);                                                 \
-            err = AVERROR(EINVAL);                                                              \
-            goto end;                                                                           \
-        } else if (fidx < 0 || ctx_qf < 0) {                                                    \
-            break;                                                                              \
-        } else if (ctx_qf >= qf_num) {                                                          \
-            av_log(ctx, AV_LOG_ERROR, "Invalid %s family index %i (device has %i families)!\n", \
-                   type, ctx_qf, qf_num);                                                       \
-            err = AVERROR(EINVAL);                                                              \
-            goto end;                                                                           \
-        }                                                                                       \
-                                                                                                \
-        av_log(ctx, AV_LOG_VERBOSE, "Using queue family %i (queues: %i)"                        \
-               " for%s%s%s%s%s\n",                                                              \
-               ctx_qf, qc,                                                                      \
-               ctx_qf == graph_index ? " graphics" : "",                                        \
-               ctx_qf == comp_index  ? " compute" : "",                                         \
-               ctx_qf == tx_index    ? " transfers" : "",                                       \
-               ctx_qf == enc_index   ? " encode" : "",                                          \
-               ctx_qf == dec_index   ? " decode" : "");                                         \
-        graph_index = (ctx_qf == graph_index) ? -1 : graph_index;                               \
-        comp_index  = (ctx_qf == comp_index)  ? -1 : comp_index;                                \
-        tx_index    = (ctx_qf == tx_index)    ? -1 : tx_index;                                  \
-        enc_index   = (ctx_qf == enc_index)   ? -1 : enc_index;                                 \
-        dec_index   = (ctx_qf == dec_index)   ? -1 : dec_index;                                 \
-    } while (0)
-
-    CHECK_QUEUE("graphics", 0, graph_index, hwctx->queue_family_index,        hwctx->nb_graphics_queues);
-    CHECK_QUEUE("compute",  1, comp_index,  hwctx->queue_family_comp_index,   hwctx->nb_comp_queues);
-    CHECK_QUEUE("upload",   1, tx_index,    hwctx->queue_family_tx_index,     hwctx->nb_tx_queues);
-    CHECK_QUEUE("decode",   0, dec_index,   hwctx->queue_family_decode_index, hwctx->nb_decode_queues);
-    CHECK_QUEUE("encode",   0, enc_index,   hwctx->queue_family_encode_index, hwctx->nb_encode_queues);
-
-#undef CHECK_QUEUE
-
-    /* Update the new queue family fields. If non-zero already,
-     * it means API users have set it. */
-    if (!hwctx->nb_qf) {
-#define ADD_QUEUE(ctx_qf, qc, flag)                                    \
-    do {                                                               \
-        if (ctx_qf != -1) {                                            \
-            hwctx->qf[hwctx->nb_qf++] = (AVVulkanDeviceQueueFamily) {  \
-                .idx = ctx_qf,                                         \
-                .num = qc,                                             \
-                .flags = flag,                                         \
-            };                                                         \
-        }                                                              \
-    } while (0)
-
-        ADD_QUEUE(hwctx->queue_family_index, hwctx->nb_graphics_queues, VK_QUEUE_GRAPHICS_BIT);
-        ADD_QUEUE(hwctx->queue_family_comp_index, hwctx->nb_comp_queues, VK_QUEUE_COMPUTE_BIT);
-        ADD_QUEUE(hwctx->queue_family_tx_index, hwctx->nb_tx_queues, VK_QUEUE_TRANSFER_BIT);
-        ADD_QUEUE(hwctx->queue_family_decode_index, hwctx->nb_decode_queues, VK_QUEUE_VIDEO_DECODE_BIT_KHR);
-        ADD_QUEUE(hwctx->queue_family_encode_index, hwctx->nb_encode_queues, VK_QUEUE_VIDEO_ENCODE_BIT_KHR);
-#undef ADD_QUEUE
-    }
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     for (int i = 0; i < hwctx->nb_qf; i++) {
         if (!hwctx->qf[i].video_caps &&
@@ -2316,7 +2215,7 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
                                     NULL, NULL, NULL, NULL, p->disable_multiplane, 1) >= 0;
     }
 
-    constraints->valid_sw_formats = av_malloc_array(count + 1,
+    constraints->valid_sw_formats = av_malloc_array(count + 1 + CONFIG_CUDA,
                                                     sizeof(enum AVPixelFormat));
     if (!constraints->valid_sw_formats)
         return AVERROR(ENOMEM);
@@ -2330,6 +2229,10 @@ static int vulkan_frames_get_constraints(AVHWDeviceContext *ctx,
             constraints->valid_sw_formats[count++] = vk_formats_list[i].pixfmt;
         }
     }
+
+#if CONFIG_CUDA
+    constraints->valid_sw_formats[count++] = AV_PIX_FMT_CUDA;
+#endif
 
     constraints->valid_sw_formats[count++] = AV_PIX_FMT_NONE;
 
@@ -2409,6 +2312,10 @@ static int alloc_mem(AVHWDeviceContext *ctx, VkMemoryRequirements *req,
 static void vulkan_free_internal(VulkanDevicePriv *p, AVVkFrame *f)
 {
     av_unused AVVkFrameInternal *internal = f->internal;
+
+    // Make this function safe to call repeatedly
+    if (!internal)
+        return;
 
 #if CONFIG_CUDA
     if (internal->cuda_fc_ref) {
@@ -2896,7 +2803,7 @@ static void try_export_flags(AVHWFramesContext *hwfc,
     VkPhysicalDeviceImageFormatInfo2 pinfo = {
         .sType  = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
         .pNext  = !exp ? NULL : &enext,
-        .format = vk_find_format_entry(hwfc->sw_format)->vkf,
+        .format = hwctx->format[0],
         .type   = VK_IMAGE_TYPE_2D,
         .tiling = hwctx->tiling,
         .usage  = hwctx->usage,
@@ -3972,6 +3879,7 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
     CudaFunctions *cu = cu_internal->cuda_dl;
     CUarray_format cufmt = desc->comp[0].depth > 8 ? CU_AD_FORMAT_UNSIGNED_INT16 :
                                                      CU_AD_FORMAT_UNSIGNED_INT8;
+    const int elem_size = 1 + (desc->comp[0].depth > 8);
 
     dst_f = (AVVkFrame *)frame->data[0];
     dst_int = dst_f->internal;
@@ -3998,6 +3906,18 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
 
         if (nb_images != planes) {
             for (int i = 0; i < planes; i++) {
+                /* Cuda now defines array formats for semi-planar, but these are
+                 * not currently supported for imported Vulkan images. */
+                if (desc->comp[i].step / elem_size > 1) {
+                    av_log(ctx, AV_LOG_ERROR,
+                           "Cannot map a multiplane Vulkan image (%d image(s) "
+                           "for %d plane(s)) to CUDA; create the Vulkan device "
+                           "with the disable_multiplane=1 option (one image per "
+                           "plane) for CUDA interop.\n", nb_images, planes);
+                    err = AVERROR(ENOSYS);
+                    goto fail;
+                }
+
                 VkImageSubresource subres = {
                     .aspectMask = i == 2 ? VK_IMAGE_ASPECT_MEMORY_PLANE_2_BIT_EXT :
                                   i == 1 ? VK_IMAGE_ASPECT_MEMORY_PLANE_1_BIT_EXT :
@@ -4016,7 +3936,7 @@ static int vulkan_export_to_cuda(AVHWFramesContext *hwfc,
                 .arrayDesc = {
                     .Depth = 0,
                     .Format = cufmt,
-                    .NumChannels = 1 + ((planes == 2) && i),
+                    .NumChannels = desc->comp[i].step / elem_size,
                     .Flags = 0,
                 },
                 .numLevels = 1,
@@ -4063,6 +3983,7 @@ static int vulkan_transfer_data_from_cuda(AVHWFramesContext *hwfc,
     VulkanFramesPriv *fp = hwfc->hwctx;
     const int planes = av_pix_fmt_count_planes(hwfc->sw_format);
     const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hwfc->sw_format);
+    int nb_images;
 
     AVHWFramesContext *cuda_fc = (AVHWFramesContext*)src->hw_frames_ctx->data;
     AVHWDeviceContext *cuda_cu = cuda_fc->device_ctx;
@@ -4073,6 +3994,7 @@ static int vulkan_transfer_data_from_cuda(AVHWFramesContext *hwfc,
     CUDA_EXTERNAL_SEMAPHORE_SIGNAL_PARAMS s_s_par[AV_NUM_DATA_POINTERS] = { 0 };
 
     dst_f = (AVVkFrame *)dst->data[0];
+    nb_images = ff_vk_count_images(dst_f);
 
     err = prepare_frame(hwfc, &fp->upload_exec, dst_f, PREP_MODE_EXTERNAL_EXPORT);
     if (err < 0)
@@ -4090,13 +4012,13 @@ static int vulkan_transfer_data_from_cuda(AVHWFramesContext *hwfc,
 
     dst_int = dst_f->internal;
 
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < nb_images; i++) {
         s_w_par[i].params.fence.value = dst_f->sem_value[i] + 0;
         s_s_par[i].params.fence.value = dst_f->sem_value[i] + 1;
     }
 
     err = CHECK_CU(cu->cuWaitExternalSemaphoresAsync(dst_int->cu_sem, s_w_par,
-                                                     planes, cuda_dev->stream));
+                                                     nb_images, cuda_dev->stream));
     if (err < 0)
         goto fail;
 
@@ -4123,11 +4045,11 @@ static int vulkan_transfer_data_from_cuda(AVHWFramesContext *hwfc,
     }
 
     err = CHECK_CU(cu->cuSignalExternalSemaphoresAsync(dst_int->cu_sem, s_s_par,
-                                                       planes, cuda_dev->stream));
+                                                       nb_images, cuda_dev->stream));
     if (err < 0)
         goto fail;
 
-    for (int i = 0; i < planes; i++)
+    for (int i = 0; i < nb_images; i++)
         dst_f->sem_value[i]++;
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
@@ -4978,7 +4900,7 @@ static int vulkan_transfer_data_to_cuda(AVHWFramesContext *hwfc, AVFrame *dst,
 
     dst_int = dst_f->internal;
 
-    for (int i = 0; i < planes; i++) {
+    for (int i = 0; i < nb_images; i++) {
         s_w_par[i].params.fence.value = dst_f->sem_value[i] + 0;
         s_s_par[i].params.fence.value = dst_f->sem_value[i] + 1;
     }
@@ -5015,7 +4937,7 @@ static int vulkan_transfer_data_to_cuda(AVHWFramesContext *hwfc, AVFrame *dst,
     if (err < 0)
         goto fail;
 
-    for (int i = 0; i < planes; i++)
+    for (int i = 0; i < nb_images; i++)
         dst_f->sem_value[i]++;
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));

@@ -543,6 +543,7 @@ static int get_pixel_format(AVCodecContext *avctx)
                      CONFIG_AV1_D3D11VA_HWACCEL * 2 + \
                      CONFIG_AV1_D3D12VA_HWACCEL + \
                      CONFIG_AV1_NVDEC_HWACCEL + \
+                     CONFIG_AV1_NVDEC_CUARRAY_HWACCEL + \
                      CONFIG_AV1_VAAPI_HWACCEL + \
                      CONFIG_AV1_VDPAU_HWACCEL + \
                      CONFIG_AV1_VIDEOTOOLBOX_HWACCEL + \
@@ -566,6 +567,9 @@ static int get_pixel_format(AVCodecContext *avctx)
 #endif
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         *fmtp++ = AV_PIX_FMT_VAAPI;
@@ -593,6 +597,9 @@ static int get_pixel_format(AVCodecContext *avctx)
 #endif
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         *fmtp++ = AV_PIX_FMT_VAAPI;
@@ -646,10 +653,16 @@ static int get_pixel_format(AVCodecContext *avctx)
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
 #endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
+#endif
         break;
     case AV_PIX_FMT_GRAY10:
 #if CONFIG_AV1_NVDEC_HWACCEL
         *fmtp++ = AV_PIX_FMT_CUDA;
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        *fmtp++ = AV_PIX_FMT_CUARRAY;
 #endif
         break;
     }
@@ -688,8 +701,8 @@ static int get_pixel_format(AVCodecContext *avctx)
 
 static void av1_frame_unref(AV1Frame *f)
 {
-    ff_progress_frame_unref(&f->pf);
     av_refstruct_unref(&f->hwaccel_picture_private);
+    ff_progress_frame_unref(&f->pf);
     av_refstruct_unref(&f->header_ref);
     f->raw_frame_header = NULL;
     f->spatial_id = f->temporal_id = 0;
@@ -791,15 +804,6 @@ static int set_context_with_sequence(AVCodecContext *avctx,
         avctx->chroma_sample_location = AVCHROMA_LOC_TOPLEFT;
         break;
     }
-
-#if FF_API_CODEC_PROPS
-FF_DISABLE_DEPRECATION_WARNINGS
-    if (seq->film_grain_params_present)
-        avctx->properties |= FF_CODEC_PROPERTY_FILM_GRAIN;
-    else
-        avctx->properties &= ~FF_CODEC_PROPERTY_FILM_GRAIN;
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
     if (avctx->width != width || avctx->height != height) {
         int ret = ff_set_dimensions(avctx, width, height);
@@ -1563,6 +1567,9 @@ const FFCodec ff_av1_decoder = {
 #endif
 #if CONFIG_AV1_NVDEC_HWACCEL
         HWACCEL_NVDEC(av1),
+#endif
+#if CONFIG_AV1_NVDEC_CUARRAY_HWACCEL
+        HWACCEL_NVDEC_CUARRAY(av1),
 #endif
 #if CONFIG_AV1_VAAPI_HWACCEL
         HWACCEL_VAAPI(av1),
