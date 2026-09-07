@@ -22,6 +22,7 @@
 /dict
 /display
 /dovi_meta
+/downmix_info
 /error
 /encryption_info
 /eval
@@ -29,8 +30,10 @@
 /file
 /film_grain_params
 /hash
+/hdr_dynamic_metadata
 /hdr_dynamic_vivid_metadata
 /hmac
+/hwcontext_cuda
 /hwdevice
 /imgutils
 /integer
@@ -55,6 +58,7 @@
 /samplefmt
 /sha
 /sha512
+/side_data
 /side_data_array
 /softfloat
 /spherical

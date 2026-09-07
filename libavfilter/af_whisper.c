@@ -47,6 +47,8 @@ typedef struct WhisperContext {
     char *model_path;
     const char *language;
     char *language_str;
+    char *locked_language;
+    bool lock_language;
     bool translate;
     bool use_gpu;
     int gpu_device;
@@ -300,6 +302,39 @@ static int64_t find_energy_onset_ms(const float *samples, int n_samples)
     }
     av_free(frame_e);
     return onset_frame >= 0 ? (int64_t)onset_frame * 10 : -1;
+}
+
+/* The worker updates language before clearing infer_pending; the synchronous
+ * EOF path waits for that handoff before reading or updating language. */
+static void lock_detected_language(AVFilterContext *ctx, const char *segments_json)
+{
+    WhisperContext *wctx = ctx->priv;
+    int lang_id;
+    const char *language;
+    char *detected;
+
+    if (!wctx->lock_language || !segments_json ||
+        !strcmp(segments_json, "[]") || av_strcasecmp(wctx->language, "auto"))
+        return;
+
+    lang_id = whisper_full_lang_id(wctx->ctx_wsp);
+    language = lang_id >= 0 ? whisper_lang_str(lang_id) : NULL;
+    if (!language) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Cannot lock auto-detected language: invalid language id %d\n", lang_id);
+        return;
+    }
+
+    detected = av_strdup(language);
+    if (!detected) {
+        av_log(ctx, AV_LOG_ERROR,
+               "Failed to allocate locked language; retrying on a later chunk\n");
+        return;
+    }
+
+    wctx->locked_language = detected;
+    wctx->language = detected;
+    av_log(ctx, AV_LOG_INFO, "Locked auto-detected language: %s\n", detected);
 }
 
 #if WHISPER_HAS_THREADS
@@ -563,6 +598,8 @@ static void *whisper_infer_thread(void *arg)
             char *closed = av_asprintf("%s]", segments_json);
             av_freep(&segments_json);
             segments_json = closed;
+
+            lock_detected_language(ctx, segments_json);
 
             /* If only "[]", set to NULL (no valid segments) */
             if (strcmp(segments_json, "[]") == 0)
@@ -915,18 +952,25 @@ static int init(AVFilterContext *ctx)
         wctx->avio_context->direct = AVIO_FLAG_DIRECT;
     }
 
+    // 'eval' and 'lock' both auto-detect; they differ only in whether the
+    // detected language is reused for the following chunks
+    const char *lang = wctx->language_str;
+    wctx->lock_language = !strcmp(lang, "lock");
+    if (wctx->lock_language || !strcmp(lang, "eval"))
+        lang = "auto";
+
     if (!whisper_is_multilingual(wctx->ctx_wsp)) {
-        if (!wctx->translate && strcmp(wctx->language_str, "auto") == 0) {
+        if (!wctx->translate && strcmp(lang, "auto") == 0) {
             av_log(ctx, AV_LOG_WARNING,
                    "Multilingual model not provided. Non-English audio may not be correctly transcribed.\n");
-        } else if (wctx->translate || (strcmp(wctx->language_str, "auto") != 0 && strcmp(wctx->language_str, "en") != 0)) {
+        } else if (wctx->translate || (strcmp(lang, "auto") != 0 && strcmp(lang, "en") != 0)) {
             av_log(ctx, AV_LOG_ERROR,
                    "%s requested but multilingual model not provided.\n", wctx->translate ? "Translation" : "Transcription");
             return AVERROR(ENOSYS);
         }
         wctx->language = "en";
     } else
-        wctx->language = wctx->language_str;
+        wctx->language = lang;
 
 #if WHISPER_HAS_THREADS
     wctx->filter_ctx = ctx;
@@ -998,6 +1042,7 @@ static void uninit(AVFilterContext *ctx)
     }
 
     av_freep(&wctx->audio_buffer);
+    av_freep(&wctx->locked_language);
 
     if (wctx->avio_context)
         avio_closep(&wctx->avio_context);
@@ -1148,6 +1193,8 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     char *closed = av_asprintf("%s]", segments_json);
     av_freep(&segments_json);
     segments_json = closed;
+
+    lock_detected_language(ctx, segments_json);
 
     AVDictionary **metadata = &frame->metadata;
     if (metadata && strcmp(segments_json, "[]") != 0) {
@@ -1500,7 +1547,7 @@ static int query_formats(const AVFilterContext *ctx,
 
 static const AVOption whisper_options[] = {
     { "model", "Path to the whisper.cpp model file", OFFSET(model_path), AV_OPT_TYPE_STRING,.flags = FLAGS },
-    { "language", "Language for transcription ('auto' for auto-detect)", OFFSET(language_str), AV_OPT_TYPE_STRING, {.str = "auto"}, .flags = FLAGS },
+    { "language", "Language for transcription ('auto', 'eval' or 'lock' for auto-detect)", OFFSET(language_str), AV_OPT_TYPE_STRING, {.str = "auto"}, .flags = FLAGS },
     { "translate", "Translate from source language to English", OFFSET(translate), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, .flags = FLAGS },
     { "queue", "Audio queue size", OFFSET(queue), AV_OPT_TYPE_DURATION, {.i64 = 10000000}, 20000, HOURS, .flags = FLAGS },
     { "use_gpu", "Use GPU for processing", OFFSET(use_gpu), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, .flags = FLAGS },

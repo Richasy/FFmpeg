@@ -16,6 +16,9 @@ endif
 BIN2CEXE = ffbuild/bin2c$(HOSTEXESUF)
 BIN2C = $(BIN2CEXE)
 
+# $(call INSTALL_FILES, install options, files, destination)
+INSTALL_FILES = $(INSTALL) $(1) $(2) "$(3)"
+
 ifndef V
 Q      = @
 ECHO   = printf "$(1)\t%s\n" $(2)
@@ -27,7 +30,7 @@ M      = @$(call ECHO,$(TAG),$@);
 $(foreach VAR,$(BRIEF), \
     $(eval override $(VAR) = @$$(call ECHO,$(VAR),$$(MSG)); $($(VAR))))
 $(foreach VAR,$(SILENT),$(eval override $(VAR) = @$($(VAR))))
-$(eval INSTALL = @$(call ECHO,INSTALL,$$(^:$(SRC_PATH)/%=%)); $(INSTALL))
+INSTALL_FILES = @$(foreach F,$(2),printf 'INSTALL\t%s -> %s\n' "$(F:$(SRC_PATH)/%=%)" "$(3)"; )$(INSTALL) $(1) $(2) "$(3)"
 endif
 
 # Prepend to a recursively expanded variable without making it simply expanded.
@@ -256,7 +259,7 @@ $(TOOLOBJS): | tools
 
 OUTDIRS := $(OUTDIRS) $(dir $(OBJS) $(HOBJS) $(HOSTOBJS) $(SHLIBOBJS) $(STLIBOBJS) $(TESTOBJS))
 
-CLEANSUFFIXES     = *.d *.gcda *.gcno *.h.c *.ho *.map *.o *.objs *.pc *.ptx *.ptx.gz *.ptx.c *.spv *.spv.gz *.spv.c *.gen.asm *.gen.c *.gen.S *.ver *.version *.html.gz *.html.c *.css.min.gz *.css.min *.css.c *~ *.ilk *.pdb
+CLEANSUFFIXES     = *.d *.gcda *.gcno *.h.c *.map *.o *.objs *.pc *.ptx *.ptx.gz *.ptx.c *.spv *.spv.gz *.spv.c *.gen.asm *.gen.c *.gen.S *.ver *.version *.html.gz *.html.c *.css.min.gz *.css.min *.css.c *~ *.ilk *.pdb
 LIBSUFFIXES       = *.a *.lib *.so *.so.* *.dylib *.dll *.def *.dll.a
 
 define RULES

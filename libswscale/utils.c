@@ -44,7 +44,6 @@
 #include "libavutil/thread.h"
 #include "libavutil/aarch64/cpu.h"
 #include "libavutil/ppc/cpu.h"
-#include "libavutil/x86/asm.h"
 #include "libavutil/x86/cpu.h"
 #include "libavutil/loongarch/cpu.h"
 
@@ -1233,6 +1232,9 @@ av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
     SwsScaler scaler_sub = sws->scaler_sub ? sws->scaler_sub : sws->scaler;
     int lum_scaler = scaler_flag(sws->scaler, i == SWS_BICUBLIN ? SWS_BICUBIC  : i);
     int chr_scaler = scaler_flag(scaler_sub,  i == SWS_BICUBLIN ? SWS_BILINEAR : i);
+    const int info_scaler = sws->scaler == SWS_SCALE_AUTO &&
+                            i == SWS_BICUBLIN &&
+                            chr_scaler == SWS_BILINEAR ? i : lum_scaler;
 
     /* sanity check */
     if (srcW < 1 || srcH < 1 || dstW < 1 || dstH < 1) {
@@ -1758,7 +1760,7 @@ av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
         const char *scaler = NULL, *cpucaps;
 
         for (i = 0; i < FF_ARRAY_ELEMS(scale_algorithms); i++) {
-            if (flags & scale_algorithms[i].flag) {
+            if (info_scaler == scale_algorithms[i].flag) {
                 scaler = scale_algorithms[i].description;
                 break;
             }
@@ -1841,8 +1843,8 @@ static int context_init_threaded(SwsContext *sws,
     SwsInternal *c = sws_internal(sws);
     int ret;
 
-    ret = avpriv_slicethread_create(&c->slicethread, (void*) sws,
-                                    ff_sws_slice_worker, NULL, sws->threads);
+    ret = avpriv_slicethread_create2(&c->slicethread, (void*) sws,
+                                     ff_sws_slice_worker, NULL, sws->threads);
     if (ret == AVERROR(ENOSYS)) {
         sws->threads = 1;
         return 0;
@@ -1852,8 +1854,7 @@ static int context_init_threaded(SwsContext *sws,
     sws->threads = ret;
 
     c->slice_ctx = av_calloc(sws->threads, sizeof(*c->slice_ctx));
-    c->slice_err = av_calloc(sws->threads, sizeof(*c->slice_err));
-    if (!c->slice_ctx || !c->slice_err)
+    if (!c->slice_ctx)
         return AVERROR(ENOMEM);
 
     for (int i = 0; i < sws->threads; i++) {
@@ -2265,7 +2266,6 @@ void sws_freeContext(SwsContext *sws)
     for (i = 0; i < c->nb_slice_ctx; i++)
         sws_freeContext(c->slice_ctx[i]);
     av_freep(&c->slice_ctx);
-    av_freep(&c->slice_err);
 
     avpriv_slicethread_free(&c->slicethread);
 
@@ -2442,4 +2442,27 @@ int ff_range_add(RangeList *rl, unsigned int start, unsigned int len)
     }
 
     return 0;
+}
+
+int ff_sws_thread_exec(void *priv,
+                       int (*func)(void *priv, int jobnr, int threadnr, int nb_jobs, int nb_threads),
+                       int nb_threads, int nb_jobs)
+{
+    AVSliceThread *slicethread;
+    int ret = avpriv_slicethread_create2(&slicethread, priv, func, NULL, nb_threads);
+    if (ret == AVERROR(ENOSYS)) {
+        /* Fallback for build configurations without threading */
+        for (int i = 0; i < nb_jobs; i++) {
+            int ret = func(priv, i, 0, nb_jobs, 1);
+            if (ret)
+                return ret;
+        }
+        return 0;
+    } else if (ret < 0) {
+        return ret;
+    }
+
+    ret = avpriv_slicethread_execute2(slicethread, nb_jobs, 0);
+    avpriv_slicethread_free(&slicethread);
+    return ret;
 }

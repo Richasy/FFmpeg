@@ -108,7 +108,6 @@ OBJS-$(CONFIG_EVCPARSE)                += evc_parse.o evc_ps.o
 OBJS-$(CONFIG_FAANDCT)                 += faandct.o
 OBJS-$(CONFIG_FAANIDCT)                += faanidct.o
 OBJS-$(CONFIG_FDCTDSP)                 += fdctdsp.o jfdctfst.o jfdctint.o
-OBJS-$(CONFIG_FMTCONVERT)              += fmtconvert.o
 OBJS-$(CONFIG_GOLOMB)                  += golomb.o
 OBJS-$(CONFIG_H263DSP)                 += h263dsp.o
 OBJS-$(CONFIG_H264CHROMA)              += h264chroma.o
@@ -348,6 +347,7 @@ OBJS-$(CONFIG_DPX_DECODER)             += dpx.o
 OBJS-$(CONFIG_DPX_ENCODER)             += dpxenc.o
 OBJS-$(CONFIG_DSD_LSBF_DECODER)        += dsddec.o dsd.o
 OBJS-$(CONFIG_DSD_MSBF_DECODER)        += dsddec.o dsd.o
+OBJS-$(CONFIG_DSD_MSBF_ENCODER)        += dsdenc.o
 OBJS-$(CONFIG_DSD_LSBF_PLANAR_DECODER) += dsddec.o dsd.o
 OBJS-$(CONFIG_DSD_MSBF_PLANAR_DECODER) += dsddec.o dsd.o
 OBJS-$(CONFIG_DSICINAUDIO_DECODER)     += dsicinaudio.o
@@ -897,6 +897,7 @@ OBJS-$(CONFIG_PCM_BLURAY_ENCODER)         += pcm-blurayenc.o
 OBJS-$(CONFIG_PCM_BLURAY_DECODER)         += pcm-bluray.o
 OBJS-$(CONFIG_PCM_DVD_DECODER)            += pcm-dvd.o
 OBJS-$(CONFIG_PCM_DVD_ENCODER)            += pcm-dvdenc.o
+OBJS-$(CONFIG_PCM_DVDA_DECODER)           += pcm-dvda.o
 OBJS-$(CONFIG_PCM_F16LE_DECODER)          += pcm.o
 OBJS-$(CONFIG_PCM_F24LE_DECODER)          += pcm.o
 OBJS-$(CONFIG_PCM_F32BE_DECODER)          += pcm.o
@@ -1377,7 +1378,6 @@ TESTPROGS = avcodec                                                     \
             bitstream_be                                                \
             bitstream_le                                                \
             codec_desc                                                  \
-            encinfo                                                     \
             htmlsubtitles                                               \
             jpeg2000dwt                                                 \
             mathops                                                    \
