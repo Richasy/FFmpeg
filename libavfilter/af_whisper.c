@@ -304,6 +304,16 @@ static int64_t find_energy_onset_ms(const float *samples, int n_samples)
     return onset_frame >= 0 ? (int64_t)onset_frame * 10 : -1;
 }
 
+static int transcription_processors(const WhisperContext *wctx, int samples)
+{
+    /* Parallel inference reports only its first worker's language. Keep that
+     * state and the accepted text together until the initial lock succeeds. */
+    if (samples < 5 * WHISPER_SAMPLE_RATE ||
+        (wctx->lock_language && !av_strcasecmp(wctx->language, "auto")))
+        return 1;
+    return wctx->n_processors;
+}
+
 /* The worker updates language before clearing infer_pending; the synchronous
  * EOF path waits for that handoff before reading or updating language. */
 static void lock_detected_language(AVFilterContext *ctx, const char *segments_json)
@@ -437,7 +447,7 @@ static void *whisper_infer_thread(void *arg)
         char *segments_json = NULL;
 
         if (whisper_full_parallel(wctx->ctx_wsp, params, samples, n_samples,
-                                  n_samples >= 5 * WHISPER_SAMPLE_RATE ? wctx->n_processors : 1) != 0) {
+                                  transcription_processors(wctx, n_samples)) != 0) {
             av_log(ctx, AV_LOG_ERROR, "Failed to process audio with whisper.cpp (async)\n");
         } else {
             const int n_segments = whisper_full_n_segments(wctx->ctx_wsp);
@@ -1091,7 +1101,7 @@ static void run_transcription(AVFilterContext *ctx, AVFrame *frame, int samples)
     }
 
     if (whisper_full_parallel(wctx->ctx_wsp, params, wctx->audio_buffer, samples,
-                              samples >= 5 * WHISPER_SAMPLE_RATE ? wctx->n_processors : 1) != 0) {
+                              transcription_processors(wctx, samples)) != 0) {
         av_log(ctx, AV_LOG_ERROR, "Failed to process audio with whisper.cpp\n");
         return;
     }

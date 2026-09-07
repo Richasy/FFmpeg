@@ -7750,7 +7750,9 @@ pass per chunk and the detected language may change mid-file.
 
 @item lock
 Detect the language on the first chunk that produces transcribed text, then
-reuse it for the remaining chunks.
+reuse it for the remaining chunks. Initial detection uses one processor so
+the language and accepted text come from the same inference state. Once the
+language is locked, the configured @option{n_processors} is used again.
 
 @item auto
 Currently an alias for @samp{eval}. This may change in a future version, so use
