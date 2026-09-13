@@ -40,6 +40,12 @@ FATE_LIBAVFORMAT-$(CONFIG_HTTP_PROTOCOL) += fate-http-status-line
 fate-http-status-line: libavformat/tests/http$(EXESUF)
 fate-http-status-line: CMD = run libavformat/tests/http$(EXESUF) $(FATE_HTTP_STATUS_LINES)
 
+FATE_HTTP_RECONNECT-$(HAVE_THREADS) += fate-http-reconnect-error
+FATE_LIBAVFORMAT-$(CONFIG_HTTP_PROTOCOL) += $(FATE_HTTP_RECONNECT-yes)
+fate-http-reconnect-error: libavformat/tests/http_reconnect$(EXESUF)
+fate-http-reconnect-error: CMD = run libavformat/tests/http_reconnect$(EXESUF)
+fate-http-reconnect-error: CMP = null
+
 FATE_LIBAVFORMAT-$(CONFIG_NETWORK) += fate-noproxy
 fate-noproxy: libavformat/tests/noproxy$(EXESUF)
 fate-noproxy: CMD = run libavformat/tests/noproxy$(EXESUF)
