@@ -33,6 +33,12 @@
 #include <poll.h>
 #endif
 
+enum TCPPreferFamily {
+    TCP_PREFER_FAMILY_AUTO,
+    TCP_PREFER_FAMILY_IPV4,
+    TCP_PREFER_FAMILY_IPV6,
+};
+
 typedef struct TCPContext {
     const AVClass *class;
     int fd;
@@ -46,6 +52,7 @@ typedef struct TCPContext {
     int send_buffer_size;
     int tcp_nodelay;
     int tcp_keepalive;
+    int prefer_family;
 #if !HAVE_WINSOCK2_H
     int tcp_mss;
 #endif /* !HAVE_WINSOCK2_H */
@@ -64,6 +71,10 @@ static const AVOption options[] = {
     { "recv_buffer_size", "Socket receive buffer size (in bytes)",             OFFSET(recv_buffer_size), AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
     { "tcp_nodelay", "Use TCP_NODELAY to disable nagle's algorithm",           OFFSET(tcp_nodelay), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
     { "tcp_keepalive", "Use TCP keepalive to detect dead connections and keep long-lived connections active.",           OFFSET(tcp_keepalive), AV_OPT_TYPE_BOOL, { .i64 = 0 },             0, 1, .flags = D|E },
+    { "prefer_family", "Address family tried first when the host resolves to both IPv4 and IPv6", OFFSET(prefer_family), AV_OPT_TYPE_INT, { .i64 = TCP_PREFER_FAMILY_AUTO }, TCP_PREFER_FAMILY_AUTO, TCP_PREFER_FAMILY_IPV6, .flags = D|E, .unit = "prefer_family" },
+    { "auto", "Keep the resolver order",   0, AV_OPT_TYPE_CONST, { .i64 = TCP_PREFER_FAMILY_AUTO }, 0, 0, .flags = D|E, .unit = "prefer_family" },
+    { "ipv4", "Try IPv4 addresses first",  0, AV_OPT_TYPE_CONST, { .i64 = TCP_PREFER_FAMILY_IPV4 }, 0, 0, .flags = D|E, .unit = "prefer_family" },
+    { "ipv6", "Try IPv6 addresses first",  0, AV_OPT_TYPE_CONST, { .i64 = TCP_PREFER_FAMILY_IPV6 }, 0, 0, .flags = D|E, .unit = "prefer_family" },
 #if !HAVE_WINSOCK2_H
     { "tcp_mss",     "Maximum segment size for outgoing TCP packets",          OFFSET(tcp_mss),     AV_OPT_TYPE_INT, { .i64 = -1 },         -1, INT_MAX, .flags = D|E },
 #endif /* !HAVE_WINSOCK2_H */
@@ -145,6 +156,35 @@ static int customize_fd(void *ctx, int fd, int family)
     return 0;
 }
 
+/*
+ * Move the resolved addresses of the preferred family ahead of the others,
+ * keeping the resolver order within each family. ff_connect_parallel()
+ * interleaves the families starting with the first entry, so the other
+ * family is still attempted after its connection attempt delay or as soon
+ * as a preferred attempt fails.
+ */
+static struct addrinfo *prefer_address_family(struct addrinfo *addrs,
+                                               int family)
+{
+    struct addrinfo *preferred = NULL, **preferred_tail = &preferred;
+    struct addrinfo *others = NULL, **others_tail = &others;
+
+    while (addrs) {
+        struct addrinfo *next = addrs->ai_next;
+        addrs->ai_next = NULL;
+        if (addrs->ai_family == family) {
+            *preferred_tail = addrs;
+            preferred_tail = &addrs->ai_next;
+        } else {
+            *others_tail = addrs;
+            others_tail = &addrs->ai_next;
+        }
+        addrs = next;
+    }
+    *preferred_tail = others;
+    return preferred ? preferred : others;
+}
+
 /* return non zero if error */
 static int tcp_open(URLContext *h, const char *uri, int flags)
 {
@@ -202,6 +242,17 @@ static int tcp_open(URLContext *h, const char *uri, int flags)
         }
     }
 #endif
+
+    if (!s->listen && s->prefer_family != TCP_PREFER_FAMILY_AUTO) {
+        int family = AF_INET;
+#if HAVE_STRUCT_SOCKADDR_IN6
+        if (s->prefer_family == TCP_PREFER_FAMILY_IPV6)
+            family = AF_INET6;
+#endif
+        // The list keeps every node, so freeaddrinfo() on the new head
+        // still releases the complete resolver result.
+        ai = cur_ai = prefer_address_family(ai, family);
+    }
 
     if (s->listen > 0) {
         while (cur_ai && fd < 0) {
