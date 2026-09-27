@@ -34,7 +34,6 @@
 #include "libavutil/emms.h"
 #include "libavutil/imgutils.h"
 #include "libavutil/intreadwrite.h"
-#include "libavutil/libm.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
@@ -1222,7 +1221,8 @@ av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
     }
 
     if (i == SWS_FAST_BILINEAR) {
-        if (srcW < 8 || dstW <= 8) {
+        /* the fast bilinear scalers keep the source position in 16.16 fixed point */
+        if (srcW < 8 || dstW <= 8 || srcW >= 65536) {
             i = SWS_BILINEAR;
             flags ^= SWS_FAST_BILINEAR | i;
             sws->flags = flags;
@@ -1244,6 +1244,12 @@ av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
                srcW, srcH, dstW, dstH);
         return AVERROR(EINVAL);
     }
+
+    ret = av_image_check_size2(srcW, srcH, INT64_MAX, AV_PIX_FMT_NONE, 0, c);
+    if (ret >= 0)
+        ret = av_image_check_size2(dstW, dstH, INT64_MAX, AV_PIX_FMT_NONE, 0, c);
+    if (ret < 0)
+        return ret;
 
     if (!dstFilter)
         dstFilter = &dummyFilter;
@@ -1440,8 +1446,8 @@ av_cold int ff_sws_init_single_context(SwsContext *sws, SwsFilter *srcFilter,
      * some special code for the first and last pixel */
     if (flags & SWS_FAST_BILINEAR) {
         if (c->canMMXEXTBeUsed) {
-            lumXInc += 20;
-            chrXInc += 20;
+            lumXInc += 1;
+            chrXInc += 1;
         }
         // we don't use the x86 asm scaler if MMX is available
         else if (INLINE_MMX(cpu_flags) && c->dstBpc <= 14) {

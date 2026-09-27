@@ -1,7 +1,4 @@
 /*
- * MSVC Compatible va_copy macro
- * Copyright (c) 2012 Derek Buitenhuis
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -19,16 +16,15 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef COMPAT_VA_COPY_H
-#define COMPAT_VA_COPY_H
+#ifndef AVFORMAT_CBS_AV1_H
+#define AVFORMAT_CBS_AV1_H
 
-#include <stdarg.h>
+#include "cbs.h"
 
-#if !defined(va_copy) && defined(_MSC_VER)
-#define va_copy(dst, src) ((dst) = (src))
-#endif
-#if !defined(va_copy) && defined(__GNUC__) && __GNUC__ < 3
-#define va_copy(dst, src) __va_copy(dst, src)
-#endif
+#define CBS_AV1_OBU_TILE_LIST 0
+#define CBS_AV1_OBU_METADATA 0
+#define CBS_AV1_OBU_PADDING 0
 
-#endif /* COMPAT_VA_COPY_H */
+#include "libavcodec/cbs_av1.h"
+
+#endif /* AVFORMAT_CBS_AV1_H */

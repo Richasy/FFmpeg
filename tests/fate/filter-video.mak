@@ -184,6 +184,9 @@ fate-filter-lavd-scalenorm: CMD = framecrc -f lavfi -graph_file $(TARGET_PATH)/t
 FATE_FILTER-$(call FILTERFRAMECRC, COLOR FORMAT SCALE CROP) += fate-filter-scale-fast-bilinear-wide-edge
 fate-filter-scale-fast-bilinear-wide-edge: CMD = framecrc -flags bitexact -lavfi color=c=red:s=40000x1:r=1:d=1,format=yuv444p,scale=40032:1:flags=fast_bilinear,crop=1:1:40031:0 -frames:v 1
 
+FATE_FILTER-$(call FILTERFRAMECRC, NULLSRC GEQ FORMAT SCALE CROP) += fate-filter-scale-fast-bilinear-wide-wrap
+fate-filter-scale-fast-bilinear-wide-wrap: CMD = framecrc -flags bitexact -lavfi 'nullsrc=s=300000x1,geq=lum=X*255/W:cb=128:cr=128,format=gray,scale=300032:1:flags=fast_bilinear,crop=1:1:279000:0' -frames:v 1
+
 FATE_FILTER-$(call FILTERFRAMECRC, TESTSRC2 FEEDBACK HFLIP, LAVFI_INDEV) += fate-filter-feedback-hflip
 fate-filter-feedback-hflip: CMD = framecrc -f lavfi -i testsrc2=d=1 -vf "[in][hflipin]feedback=x=0:y=0:w=100:h=100[out][hflipout];[hflipout]hflip[hflipin]"
 
@@ -238,6 +241,9 @@ fate-filter-negate: CMD = framecrc -c:v pgmyuv -i $(SRC) -vf perms=random,negate
 
 FATE_FILTER_VSYNTH_PGMYUV-$(CONFIG_HISTOGRAM_FILTER) += fate-filter-histogram-levels
 fate-filter-histogram-levels: CMD = framecrc -c:v pgmyuv -i $(SRC) -vf histogram -flags +bitexact -sws_flags +accurate_rnd+bitexact
+
+FATE_FILTER-$(call FILTERFRAMECRC, TESTSRC2 FORMAT THISTOGRAM) += fate-filter-thistogram-scroll
+fate-filter-thistogram-scroll: CMD = framecrc -lavfi testsrc2=s=65x49:r=1:d=1,format=yuv420p,thistogram=display_mode=parade:components=7:slide=scroll -flags +bitexact
 
 FATE_FILTER_VSYNTH_PGMYUV-$(CONFIG_WAVEFORM_FILTER) += fate-filter-waveform_column
 fate-filter-waveform_column: CMD = framecrc -c:v pgmyuv -i $(SRC) -vf waveform -flags +bitexact -sws_flags +accurate_rnd+bitexact
@@ -497,6 +503,10 @@ fate-filter-fps-down-round-up: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:ro
 fate-filter-fps-down-eof-pass: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:eof_action=pass
 fate-filter-fps-start-drop: CMD = framecrc -lavfi testsrc2=r=7:d=3.5,fps=3:start_time=1.5
 fate-filter-fps-start-fill: CMD = framecrc -lavfi testsrc2=r=7:d=1.5,setpts=PTS+14,fps=3:start_time=1.5
+
+FATE_FILTER-yes += fate-filter-drawutils
+fate-filter-drawutils: libavfilter/tests/drawutils$(EXESUF)
+fate-filter-drawutils: CMD = run libavfilter/tests/drawutils$(EXESUF)
 
 DRAWVG_SCRIPT_ALL = $(SRC_PATH)/tests/ref/lavf/drawvg.all
 

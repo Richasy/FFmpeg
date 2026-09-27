@@ -1,7 +1,4 @@
 /*
- * C99-compatible snprintf() and vsnprintf() implementations
- * Copyright (c) 2012 Ronald S. Bultje <rsbultje@gmail.com>
- *
  * This file is part of FFmpeg.
  *
  * FFmpeg is free software; you can redistribute it and/or
@@ -19,20 +16,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef COMPAT_MSVCRT_SNPRINTF_H
-#define COMPAT_MSVCRT_SNPRINTF_H
+#ifndef AVCODEC_RISCV_FDCT_H
+#define AVCODEC_RISCV_FDCT_H
 
-#include <stdarg.h>
-#include <stdio.h>
+#include <stdint.h>
 
-int avpriv_snprintf(char *s, size_t n, const char *fmt, ...);
-int avpriv_vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
+void ff_fdct_rvv(int16_t *block);
 
-#undef snprintf
-#undef _snprintf
-#undef vsnprintf
-#define snprintf avpriv_snprintf
-#define _snprintf avpriv_snprintf
-#define vsnprintf avpriv_vsnprintf
-
-#endif /* COMPAT_MSVCRT_SNPRINTF_H */
+#endif /* AVCODEC_RISCV_FDCT_H */

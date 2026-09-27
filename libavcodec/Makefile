@@ -1182,6 +1182,8 @@ OBJS-$(CONFIG_LIBAOM_AV1_DECODER)         += libaomdec.o libaom.o
 OBJS-$(CONFIG_LIBAOM_AV1_ENCODER)         += libaomenc.o libaom.o
 OBJS-$(CONFIG_LIBARIBB24_DECODER)         += libaribb24.o ass.o
 OBJS-$(CONFIG_LIBARIBCAPTION_DECODER)     += libaribcaption.o ass.o
+OBJS-$(CONFIG_LIBASTCENC_ENCODER)         += libastcenc.o
+OBJS-$(CONFIG_LIBASTCENC_DECODER)         += libastcdec.o
 OBJS-$(CONFIG_LIBCODEC2_DECODER)          += libcodec2.o
 OBJS-$(CONFIG_LIBCODEC2_ENCODER)          += libcodec2.o
 OBJS-$(CONFIG_LIBDAV1D_DECODER)           += libdav1d.o av1_parse.o
@@ -1382,6 +1384,7 @@ TESTPROGS = avcodec                                                     \
             jpeg2000dwt                                                 \
             mathops                                                    \
 
+TESTPROGS-$(CONFIG_AC3DSP)                += ac3
 TESTPROGS-$(CONFIG_APV_DECODER)           += apv
 TESTPROGS-$(CONFIG_AV1_VAAPI_ENCODER)     += av1_levels
 TESTPROGS-$(CONFIG_CABAC)                 += cabac
@@ -1390,6 +1393,7 @@ TESTPROGS-$(CONFIG_GOLOMB)                += golomb
 TESTPROGS-$(CONFIG_IDCTDSP)               += dct
 TESTPROGS-$(CONFIG_DXV_ENCODER)           += hashtable
 TESTPROGS-$(CONFIG_MJPEG_ENCODER)         += mjpegenc_huffman
+TESTPROGS-$(CONFIG_MPEGAUDIOHEADER)       += mpegaudiodecheader
 TESTPROGS-$(CONFIG_MPEGVIDEO)             += mpeg12framerate
 TESTPROGS-$(CONFIG_H264_METADATA_BSF)     += h264_levels
 TESTPROGS-$(CONFIG_HEVC_METADATA_BSF)     += h265_levels
