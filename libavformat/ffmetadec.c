@@ -49,7 +49,7 @@ static int64_t read_line_to_bprint_escaped(AVIOContext *s, AVBPrint *bp)
             end = prev != '\\' && (c == '\r' || c == '\n' || c == '\0');
             if (!end)
                 tmp[len++] = c;
-            prev = c;
+            prev = c == '\\' && prev == '\\' ? ' ' : c;
         } while (!end && len < sizeof(tmp));
         av_bprint_append_data(bp, tmp, len);
         read += len;
