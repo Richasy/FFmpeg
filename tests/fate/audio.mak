@@ -72,7 +72,7 @@ fate-nellymoser: CMD = pcm -i $(TARGET_SAMPLES)/nellymoser/nellymoser.flv
 fate-nellymoser: CMP = oneoff
 fate-nellymoser: REF = $(SAMPLES)/nellymoser/nellymoser.pcm
 
-FATE_SAMPLES_AUDIO-$(call ENCMUX, NELLYMOSER, FLV, ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode
+FATE_SAMPLES_AUDIO-$(call ENCDEC, NELLYMOSER, FLV, WAV_MUXER WAV_DEMUXER PCM_S16LE_ENCODER PCM_S16LE_DECODER ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode
 fate-nellymoser-aref-encode: $(AREF) ./tests/data/asynth-16000-1.wav
 fate-nellymoser-aref-encode: CMD = enc_dec_pcm flv wav s16le $(REF) -c:a nellymoser
 fate-nellymoser-aref-encode: CMP = stddev
@@ -81,11 +81,23 @@ fate-nellymoser-aref-encode: CMP_SHIFT = -256
 fate-nellymoser-aref-encode: CMP_TARGET = 3863
 fate-nellymoser-aref-encode: SIZE_TOLERANCE = 268
 
+FATE_SAMPLES_AUDIO-$(call ENCDEC, NELLYMOSER, FLV, WAV_MUXER WAV_DEMUXER PCM_S16LE_ENCODER PCM_S16LE_DECODER ARESAMPLE_FILTER PIPE_PROTOCOL) += fate-nellymoser-aref-encode-trellis
+fate-nellymoser-aref-encode-trellis: tests/data/asynth-16000-1.wav
+fate-nellymoser-aref-encode-trellis: CMD = enc_dec_pcm flv wav s16le $(REF) -c:a nellymoser -trellis 1
+fate-nellymoser-aref-encode-trellis: CMP = stddev
+fate-nellymoser-aref-encode-trellis: REF = tests/data/asynth-16000-1.wav
+fate-nellymoser-aref-encode-trellis: CMP_SHIFT = -256
+fate-nellymoser-aref-encode-trellis: CMP_TARGET = 4222
+fate-nellymoser-aref-encode-trellis: SIZE_TOLERANCE = 268
+
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, AVI, ON2AVC, ARESAMPLE_FILTER) += fate-on2avc
 fate-on2avc: CMD = framecrc -i $(TARGET_SAMPLES)/vp7/potter-40.vp7 -frames 30 -vn -af aresample
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, PAF, PAF_AUDIO) += fate-paf-audio
 fate-paf-audio: CMD = framecrc -i $(TARGET_SAMPLES)/paf/hod1-partial.paf -vn
+
+FATE_SAMPLES_AUDIO-$(call FRAMECRC, WAV, ADPCM_RHETOREX) += fate-rhetorex
+fate-rhetorex: CMD = framecrc -i $(TARGET_SAMPLES)/rhetorex/rhetorex-mono-4bit-8000.wav
 
 FATE_SAMPLES_AUDIO-$(call FRAMECRC, VMD, VMDAUDIO, ARESAMPLE_FILTER) += fate-sierra-vmd-audio
 fate-sierra-vmd-audio: CMD = framecrc -i $(TARGET_SAMPLES)/vmd/12.vmd -vn -af aresample
