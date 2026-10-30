@@ -680,6 +680,27 @@ int avio_open(AVIOContext **s, const char *url, int flags);
 int avio_open2(AVIOContext **s, const char *url, int flags,
                const AVIOInterruptCB *int_cb, AVDictionary **options);
 
+/** Synchronous HTTP observation for a single explicitly owned input.
+ * The structure is copied. opaque and callbacks must remain alive until close.
+ * A negative callback result aborts the request before further processing.
+ * Callbacks must not reenter or close the AVIOContext. Lines exclude CR/LF.
+ * Observed inputs do not emit HTTP request/response log text.
+ */
+typedef struct AVIOHTTPObserver {
+    size_t struct_size; /**< Must equal sizeof(AVIOHTTPObserver). */
+    void *opaque;
+    int (*before_request)(void *opaque);
+    int (*header)(void *opaque, const char *line, size_t length);
+} AVIOHTTPObserver;
+
+/** Open an HTTP(S) read input with synchronous request/header admission.
+ * The observer is required; other protocols and libcurl routing are rejected.
+ * Existing avio_open2 behavior is unchanged. The caller owns retry policy.
+ */
+int avio_open2_observed(AVIOContext **s, const char *url, int flags,
+                       const AVIOInterruptCB *int_cb, AVDictionary **options,
+                       const AVIOHTTPObserver *observer);
+
 /**
  * Close the resource accessed by the AVIOContext s and free it.
  * This function can only be used if s was opened by avio_open().
