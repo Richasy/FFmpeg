@@ -402,7 +402,8 @@ static int prefer_libcurl(const char *filename, AVDictionary **options,
 static int url_open_whitelist(URLContext **puc, const char *filename, int flags,
                               const AVIOInterruptCB *int_cb, AVDictionary **options,
                               const char *whitelist, const char* blacklist,
-                              URLContext *parent, AVFormatContext *avfc)
+                              URLContext *parent, AVFormatContext *avfc,
+                              const AVIOHTTPObserver *observer)
 {
     AVDictionary *tmp_opts = NULL;
     AVDictionaryEntry *e;
@@ -420,6 +421,10 @@ static int url_open_whitelist(URLContext **puc, const char *filename, int flags,
     if (ret < 0)
         return ret;
     (*puc)->avfc = avfc;
+    if (observer)
+        (*puc)->http_observer = *observer;
+    else if (parent)
+        (*puc)->http_observer = parent->http_observer;
     if (parent) {
         ret = av_opt_copy(*puc, parent);
         if (ret < 0)
@@ -469,7 +474,7 @@ int ffurl_open_whitelist(URLContext **puc, const char *filename, int flags,
                          URLContext *parent)
 {
     return url_open_whitelist(puc, filename, flags, int_cb, options,
-                              whitelist, blacklist, parent, NULL);
+                              whitelist, blacklist, parent, NULL, NULL);
 }
 
 int ffio_fdopen(AVIOContext **sp, URLContext *h)
@@ -544,7 +549,7 @@ int ffio_open_whitelist2(AVIOContext **s, const char *filename, int flags,
     *s = NULL;
 
     err = url_open_whitelist(&h, filename, flags, int_cb, options, whitelist,
-                             blacklist, NULL, avfc);
+                             blacklist, NULL, avfc, NULL);
     if (err < 0)
         return err;
     err = ffio_fdopen(s, h);
@@ -572,6 +577,34 @@ int avio_open2(AVIOContext **s, const char *filename, int flags,
 int avio_open(AVIOContext **s, const char *filename, int flags)
 {
     return avio_open2(s, filename, flags, NULL, NULL);
+}
+
+int avio_open2_observed(AVIOContext **s, const char *filename, int flags,
+                       const AVIOInterruptCB *int_cb, AVDictionary **options,
+                       const AVIOHTTPObserver *observer)
+{
+    URLContext *h = NULL;
+    AVDictionary *local = NULL;
+    int err;
+    *s = NULL;
+    if (!observer || observer->struct_size != sizeof(*observer) ||
+        !observer->before_request || !observer->header ||
+        (flags & AVIO_FLAG_WRITE) ||
+        (!av_strstart(filename, "https://", NULL) &&
+         !av_strstart(filename, "http://", NULL)))
+        return AVERROR(EINVAL);
+    if (!options)
+        options = &local;
+    if ((err = av_dict_set(options, "prefer_libcurl", "0", 0)) >= 0)
+        err = url_open_whitelist(&h, filename, flags, int_cb, options,
+                                 NULL, NULL, NULL, NULL, observer);
+    if (err >= 0) {
+        err = ffio_fdopen(s, h);
+        if (err < 0)
+            ffurl_close(h);
+    }
+    av_dict_free(&local);
+    return err;
 }
 
 

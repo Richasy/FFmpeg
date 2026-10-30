@@ -49,6 +49,7 @@ typedef struct URLContext {
     int min_packet_size;        /**< if non zero, the stream is packetized with this min packet size */
     struct AVFormatContext *avfc; /**< the AVFormatContext that opened this URLContext, or NULL for standalone use */
     int prefer_libcurl;         /**< route http(s) opens through the libcurl protocol */
+    AVIOHTTPObserver http_observer; /**< copied, opt-in synchronous HTTP admission */
 } URLContext;
 
 typedef struct URLProtocol {

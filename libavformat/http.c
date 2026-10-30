@@ -20,6 +20,7 @@
  */
 
 #include <stdbool.h>
+#include <stdarg.h>
 
 #include "config.h"
 #include "config_components.h"
@@ -176,6 +177,7 @@ typedef struct HTTPContext {
     /* Reply is a partial response with unknown total ("bytes A-B/" + '*'). */
     int content_range_unknown_size;
     int line_count;
+    int observer_mode;
 
     /******************
      * Listener state *
@@ -185,6 +187,24 @@ typedef struct HTTPContext {
     int is_multi_client;
     int is_connected_server;
 } HTTPContext;
+
+/* Raw HTTP logs contain signed targets and untrusted header text. */
+static void observed_http_log(void *ctx, int level, const char *format, ...)
+{
+    const AVClass *class = ctx ? *(const AVClass **)ctx : NULL;
+    va_list args;
+    if (class && !strcmp(class->class_name, "URLContext") &&
+        ((URLContext *)ctx)->http_observer.header)
+        return;
+    if (class && (!strcmp(class->class_name, "http") ||
+                  !strcmp(class->class_name, "https")) &&
+        ((HTTPContext *)ctx)->observer_mode)
+        return;
+    va_start(args, format);
+    av_vlog(ctx, level, format, args);
+    va_end(args);
+}
+#define av_log observed_http_log
 
 #define OFFSET(x) offsetof(HTTPContext, x)
 #define D AV_OPT_FLAG_DECODING_PARAM
@@ -262,6 +282,10 @@ static int http_open_cnx_internal(URLContext *h, AVDictionary **options)
     char buf[1024], urlbuf[MAX_URL_SIZE];
     int port, use_proxy, err = 0;
     HTTPContext *s = h->priv_data;
+
+    if (h->http_observer.before_request &&
+        (err = h->http_observer.before_request(h->http_observer.opaque)) < 0)
+        return err;
 
     av_url_split(proto, sizeof(proto), auth, sizeof(auth),
                  hostname, sizeof(hostname), &port,
@@ -892,6 +916,8 @@ static int http_open(URLContext *h, const char *uri, int flags,
     HTTPContext *s = h->priv_data;
     int ret;
 
+    s->observer_mode = h->http_observer.header != NULL;
+
     if( s->seekable == 1 )
         h->is_streamed = 0;
     else
@@ -1002,6 +1028,8 @@ static int http_get_line(HTTPContext *s, char *line, int line_size)
 
             return 0;
         } else {
+            if (s->observer_mode && (ch == 0 || (q - line) >= line_size - 1))
+                return AVERROR_INVALIDDATA;
             if ((q - line) < line_size - 1)
                 *q++ = ch;
         }
@@ -1685,9 +1713,25 @@ static int http_read_header(URLContext *h)
             return err;
         }
 
+        if (h->http_observer.header &&
+            (err = h->http_observer.header(h->http_observer.opaque,
+                                           line, strlen(line))) < 0)
+            return err;
+
         av_log(h, AV_LOG_TRACE, "header='%s'\n", line);
 
+        /* Informational fields must not configure the final response. */
+        if (s->observer_mode && s->line_count &&
+            s->http_code >= 100 && s->http_code < 200) {
+            if (!*line) s->line_count = 0;
+            continue;
+        }
+
         err = process_line(h, line, s->line_count, &parsed_http_code);
+        /* The observer owns status admission, including ordinary media bodies
+         * carried by non-2xx responses. Auth/risk/redirect policies run first. */
+        if (s->observer_mode && parsed_http_code && err < 0)
+            err = 1;
         if (err < 0) {
             if (parsed_http_code) {
                 http_err = err;
@@ -1698,6 +1742,10 @@ static int http_read_header(URLContext *h)
                 else
                     return err;
             }
+        }
+        if (err == 0 && s->observer_mode && s->http_code >= 100 && s->http_code < 200) {
+            s->line_count = 0;
+            continue;
         }
         if (err == 0)
             break;
@@ -1988,6 +2036,56 @@ static uint64_t requested_end(HTTPContext *s)
     return s->end_off ? FFMIN(s->end_off, s->filesize) : s->filesize;
 }
 
+static int observed_chunk_token(unsigned char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') || (c && strchr("!#$%&'*+-.^_`|~", c));
+}
+
+static int observed_chunk_size(const char *line, uint64_t *size)
+{
+    const unsigned char *p = (const unsigned char *)line;
+    uint64_t value = 0;
+    if (!av_isxdigit(*p)) return AVERROR_INVALIDDATA;
+    while (av_isxdigit(*p)) {
+        unsigned digit = av_isdigit(*p) ? *p - '0' : av_tolower(*p) - 'a' + 10;
+        if (value > (UINT64_MAX - 1 - digit) / 16) return AVERROR_INVALIDDATA;
+        value = value * 16 + digit;
+        p++;
+    }
+    while (*p) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p++ != ';') return AVERROR_INVALIDDATA;
+        while (*p == ' ' || *p == '\t') p++;
+        if (!observed_chunk_token(*p)) return AVERROR_INVALIDDATA;
+        while (observed_chunk_token(*p)) p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '=') {
+            p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '"') {
+                p++;
+                while (*p && *p != '"') {
+                    if (*p == '\\') {
+                        p++;
+                        if (!*p) return AVERROR_INVALIDDATA;
+                    }
+                    if ((*p < 0x20 && *p != '\t') || *p == 0x7f) return AVERROR_INVALIDDATA;
+                    p++;
+                }
+                if (*p++ != '"') return AVERROR_INVALIDDATA;
+            } else {
+                if (!observed_chunk_token(*p)) return AVERROR_INVALIDDATA;
+                while (observed_chunk_token(*p)) p++;
+            }
+        }
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p && *p != ';') return AVERROR_INVALIDDATA;
+    }
+    *size = value;
+    return 0;
+}
+
 static int http_buf_read(URLContext *h, uint8_t *buf, int size)
 {
     HTTPContext *s = h->priv_data;
@@ -2001,15 +2099,20 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
             return AVERROR_EOF;
         }
         if (!s->chunksize) {
-            char line[32];
+            char line[MAX_URL_SIZE];
             int err;
 
             do {
                 if ((err = http_get_line(s, line, sizeof(line))) < 0)
-                    return err;
+                    return s->observer_mode && err == AVERROR_EOF ? AVERROR_INVALIDDATA : err;
             } while (!*line);    /* skip CR LF from last chunk */
 
-            s->chunksize = strtoull(line, NULL, 16);
+            if (s->observer_mode) {
+                if ((err = observed_chunk_size(line, &s->chunksize)) < 0)
+                    return err;
+            } else {
+                s->chunksize = strtoull(line, NULL, 16);
+            }
 
             av_log(h, AV_LOG_TRACE,
                    "Chunked encoding data size: %"PRIu64"\n",
@@ -2019,7 +2122,21 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
                 /* a partial reply that ends at its range end is continued */
                 int more = s->range_end && s->off == s->range_end &&
                            s->range_end < requested_end(s);
-                if (s->multiple_requests) {
+                if (s->observer_mode) {
+                    char trailer[MAX_URL_SIZE];
+                    do {
+                        if ((err = http_get_line(s, trailer, sizeof(trailer))) < 0)
+                            return err == AVERROR_EOF ? AVERROR_INVALIDDATA : err;
+                        if (*trailer && (!strchr(trailer, ':') ||
+                            av_stristart(trailer, "Content-Length:", NULL) ||
+                            av_stristart(trailer, "Content-Range:", NULL) ||
+                            av_stristart(trailer, "Content-Encoding:", NULL) ||
+                            av_stristart(trailer, "Transfer-Encoding:", NULL)))
+                            return AVERROR_INVALIDDATA;
+                    } while (*trailer);
+                    s->chunkend = 1;
+                    return AVERROR_EOF;
+                } else if (s->multiple_requests) {
                     do {
                         if ((err = http_get_line(s, line, sizeof(line))) < 0)
                             return err;
@@ -2050,13 +2167,20 @@ static int http_buf_read(URLContext *h, uint8_t *buf, int size)
     } else {
         uint64_t file_end   = requested_end(s);
         uint64_t target_end = s->range_end ? s->range_end : file_end;
-        if ((!s->willclose || s->chunksize == UINT64_MAX) && s->off >= file_end)
+        if ((!s->observer_mode || s->chunksize == UINT64_MAX) &&
+            (!s->willclose || s->chunksize == UINT64_MAX) && s->off >= file_end)
             return AVERROR_EOF;
+        if (s->observer_mode && s->off == target_end && target_end != UINT64_MAX)
+            return s->chunksize == UINT64_MAX ? AVERROR_EOF : AVERROR_INVALIDDATA;
         if (s->off == target_end && target_end < file_end)
             return AVERROR(EAGAIN); /* reached end of content range */
         len = ffurl_read(s->hd, buf, size);
+        if (s->observer_mode && s->chunksize != UINT64_MAX &&
+            (!len || len == AVERROR_EOF))
+            return AVERROR_INVALIDDATA;
         if ((!len || len == AVERROR_EOF) &&
-            (!s->willclose || s->chunksize == UINT64_MAX) && s->off < target_end) {
+            (!s->willclose || s->chunksize == UINT64_MAX) && s->off < target_end &&
+            (!s->observer_mode || target_end != UINT64_MAX)) {
             av_log(h, AV_LOG_ERROR,
                    "Stream ends prematurely at %"PRIu64", should be %"PRIu64"\n",
                    s->off, target_end
@@ -2152,6 +2276,8 @@ static int http_read_stream(URLContext *h, uint8_t *buf, int size)
 
 retry:
     read_ret = http_buf_read(h, buf, size);
+    if (s->observer_mode)
+        return read_ret;
     while (read_ret < 0) {
         uint64_t target = h->is_streamed ? 0 : s->off;
         uint64_t file_end = requested_end(s);
